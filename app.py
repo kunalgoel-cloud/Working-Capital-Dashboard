@@ -238,7 +238,7 @@ if use_historic:
     df_s  = conn.query(f"SELECT * FROM customer_history  WHERE snapshot_date = '{hist_date}'", ttl=0)
     df_wh = conn.query(f"SELECT sku_title AS title, qty AS \"Qty\", value AS \"Value\" FROM inventory_history WHERE snapshot_date = '{hist_date}'", ttl=0)
     df_sl = conn.query(f"SELECT * FROM sales_history     WHERE snapshot_date = '{hist_date}'", ttl=0)
-    df_b  = conn.query(f"SELECT *, bill_date AS date FROM bills_history WHERE snapshot_date = '{hist_date}'", ttl=0)
+    df_b  = conn.query(f"SELECT bill_id, vendor_name, bcy_balance, bcy_total, bill_date AS date, snapshot_date FROM bills_history WHERE snapshot_date = '{hist_date}'", ttl=0)
     df_b["date"] = pd.to_datetime(df_b["date"], errors="coerce")
     st.info(f"📦 Showing archived snapshot from **{hist_date}**. Upload new files to see today's data.")
 
