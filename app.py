@@ -235,10 +235,11 @@ else:
 # 7. LOAD DATA — from DB snapshot OR uploaded files
 # ─────────────────────────────────────────────
 if use_historic:
-    df_s  = conn.query(f"SELECT * FROM customer_history  WHERE snapshot_date = '{hist_date}'", ttl=0)
-    df_wh = conn.query(f"SELECT sku_title AS title, qty AS \"Qty\", value AS \"Value\" FROM inventory_history WHERE snapshot_date = '{hist_date}'", ttl=0)
-    df_sl = conn.query(f"SELECT * FROM sales_history     WHERE snapshot_date = '{hist_date}'", ttl=0)
-    df_b  = conn.query(f"SELECT bill_id, vendor_name, bcy_balance, bcy_total, bill_date AS date, snapshot_date FROM bills_history WHERE snapshot_date = '{hist_date}'", ttl=0)
+    with conn.session as _s:
+        df_s  = pd.read_sql(text("SELECT * FROM customer_history WHERE snapshot_date = :d"), _s.bind, params={"d": hist_date})
+        df_wh = pd.read_sql(text('SELECT sku_title AS title, qty AS "Qty", value AS "Value" FROM inventory_history WHERE snapshot_date = :d'), _s.bind, params={"d": hist_date})
+        df_sl = pd.read_sql(text("SELECT * FROM sales_history WHERE snapshot_date = :d"), _s.bind, params={"d": hist_date})
+        df_b  = pd.read_sql(text("SELECT bill_id, vendor_name, bcy_balance, bcy_total, bill_date AS date, snapshot_date FROM bills_history WHERE snapshot_date = :d"), _s.bind, params={"d": hist_date})
     df_b["date"] = pd.to_datetime(df_b["date"], errors="coerce")
     st.info(f"📦 Showing archived snapshot from **{hist_date}**. Upload new files to see today's data.")
 
