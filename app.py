@@ -36,101 +36,105 @@ with st.sidebar:
 tab_dash, tab_map = st.tabs(["📊 Dashboard", "🔧 Manage Mappings"])
 
 if all([f_inv, f_bill, f_sales, f_wh]):
-    # Load Data
+    # Load raw CSV data
     df_inv = pd.read_csv(f_inv)
     df_bill = pd.read_csv(f_bill)
     df_sales = pd.read_csv(f_sales)
     df_wh = pd.read_csv(f_wh)
     
-    # Standardize types
     df_inv['date'] = pd.to_datetime(df_inv['date']).dt.date
     df_bill['date'] = pd.to_datetime(df_bill['date']).dt.date
-    
-    # Load existing mappings
-    df_map = conn.query("SELECT * FROM item_mappings")
 
-    # Master SKU list for dropdowns
+    # --- CRITICAL: Fetch Mappings with no-cache ---
+    # We use a query that bypasses standard caching to ensure updates are visible
+    df_map = conn.query("SELECT * FROM item_mappings", ttl=0)
+
+    # Master SKU list (Current + Historical)
     current_wh_titles = list(df_wh['title'].unique())
-    hist_titles = df_map['inventory_title'].unique().tolist()
-    master_sku_list = sorted(list(set(current_wh_titles + hist_titles + ["DISCONTINUED / OLD SKU"])))
+    master_sku_list = sorted(list(set(current_wh_titles + df_map['inventory_title'].unique().tolist() + ["DISCONTINUED / OLD SKU"])))
 
     with tab_map:
         st.header("Mapping Management")
         
-        # Determine items in file that aren't in DB yet
+        # Calculate exactly what is NOT in the database yet
         zoho_in_file = df_sales['item_name'].unique()
-        mapped_in_db = df_map['zoho_name'].values
-        unmapped = [n for n in zoho_in_file if n not in mapped_in_db]
+        mapped_names = set(df_map['zoho_name'].tolist())
+        unmapped = [n for n in zoho_in_file if n not in mapped_names]
         
-        # --- SECTION: NEW MAPPINGS ---
+        # --- TOP SECTION: NEW MAPPINGS ONLY ---
         if unmapped:
-            st.subheader(f"New Unique Items Found ({len(unmapped)})")
-            for item in unmapped[:5]:
-                c1, c2 = st.columns([3, 1])
-                
-                # Fuzzy Logic
-                matches = get_close_matches(str(item), current_wh_titles, n=1, cutoff=0.3)
-                default_val = matches[0] if matches else "DISCONTINUED / OLD SKU"
-                
-                choice = c1.selectbox(f"Map '{item}'", master_sku_list, 
-                                    index=master_sku_list.index(default_val), 
-                                    key=f"new_{item}")
-                
-                if c2.button("Save & Link", key=f"btn_{item}"):
-                    with conn.session as s:
-                        # FIXED: Use ON CONFLICT to prevent IntegrityError
-                        s.execute(text("""
-                            INSERT INTO item_mappings (zoho_name, inventory_title) 
-                            VALUES (:z, :i) 
-                            ON CONFLICT (zoho_name) DO UPDATE SET inventory_title = EXCLUDED.inventory_title
-                        """), {"z":item, "i":choice})
-                        s.commit()
-                    st.toast(f"Saved {item}")
-                    time.sleep(0.2)
-                    st.rerun()
+            st.subheader(f"⚠️ Items Needing Initial Mapping ({len(unmapped)})")
+            st.info("Once saved, these items will move to the 'Existing Mappings' section below.")
+            
+            # Process one at a time to ensure the 'unmapped' list updates correctly
+            item = unmapped[0] 
+            c1, c2 = st.columns([3, 1])
+            
+            matches = get_close_matches(str(item), current_wh_titles, n=1, cutoff=0.3)
+            default_val = matches[0] if matches else "DISCONTINUED / OLD SKU"
+            
+            choice = c1.selectbox(f"Map '{item}'", master_sku_list, 
+                                index=master_sku_list.index(default_val), 
+                                key=f"new_item_select")
+            
+            if c2.button("Save & Link", use_container_width=True):
+                with conn.session as s:
+                    s.execute(text("""
+                        INSERT INTO item_mappings (zoho_name, inventory_title) 
+                        VALUES (:z, :i) 
+                        ON CONFLICT (zoho_name) DO UPDATE SET inventory_title = EXCLUDED.inventory_title
+                    """), {"z":item, "i":choice})
+                    s.commit()
+                st.toast(f"✅ Linked {item}")
+                time.sleep(0.5)
+                st.rerun() # Forces a refresh to re-calculate the 'unmapped' list
         else:
-            st.success("All items in your current file are already mapped.")
+            st.success("🎉 All items in your current Sales file are mapped and ready!")
 
         st.divider()
         
-        # --- SECTION: EDIT MAPPINGS ---
-        st.subheader("Edit/Review Existing Mappings")
-        search = st.text_input("Search mappings...")
+        # --- BOTTOM SECTION: EXISTING MAPPINGS (SEARCHABLE) ---
+        st.subheader("📋 Existing Mappings (Archive)")
+        search = st.text_input("🔍 Search database...")
         
-        display_edit = df_map
+        # Filter logic
+        display_edit = df_map.sort_values(by='zoho_name')
         if search:
-            display_edit = df_map[df_map['zoho_name'].str.contains(search, case=False)]
+            display_edit = display_edit[display_edit['zoho_name'].str.contains(search, case=False)]
 
-        for idx, row in display_edit.head(10).iterrows():
-            c1, c2, c3 = st.columns([3, 3, 1])
-            stock_status = "🟢 In Stock" if row['inventory_title'] in current_wh_titles else "🔴 Out of Stock"
-            c1.markdown(f"**{row['zoho_name']}**\n\n*{stock_status}*")
-            
-            new_choice = c2.selectbox("Update to:", master_sku_list, 
-                                    index=master_sku_list.index(row['inventory_title']) if row['inventory_title'] in master_sku_list else 0, 
-                                    key=f"ed_{row['zoho_name']}")
-            
-            if c3.button("Update", key=f"upd_{row['zoho_name']}"):
-                with conn.session as s:
-                    s.execute(text("UPDATE item_mappings SET inventory_title = :i WHERE zoho_name = :z"), 
-                              {"i":new_choice, "z":row['zoho_name']})
-                    s.commit()
-                st.toast("Updated!")
-                st.rerun()
+        if not display_edit.empty:
+            for idx, row in display_edit.head(15).iterrows():
+                c1, c2, c3 = st.columns([3, 3, 1])
+                stock_label = "🟢 In Stock" if row['inventory_title'] in current_wh_titles else "🔴 Out of Stock"
+                c1.markdown(f"**{row['zoho_name']}** \n*{stock_label}*")
+                
+                curr_idx = master_sku_list.index(row['inventory_title']) if row['inventory_title'] in master_sku_list else 0
+                new_choice = c2.selectbox("Change mapping:", master_sku_list, index=curr_idx, key=f"edit_{row['zoho_name']}")
+                
+                if c3.button("Update", key=f"upd_{row['zoho_name']}"):
+                    with conn.session as s:
+                        s.execute(text("UPDATE item_mappings SET inventory_title = :i WHERE zoho_name = :z"), 
+                                  {"i":new_choice, "z":row['zoho_name']})
+                        s.commit()
+                    st.toast("Mapping Updated!")
+                    time.sleep(0.3)
+                    st.rerun()
+        else:
+            st.write("No mappings found.")
 
     with tab_dash:
         if len(date_range) == 2:
             start, end = date_range[0], date_range[1]
             days = (end - start).days or 365
             
-            # DSO & DPO
+            # Metrics Logic
             mask_inv = (df_inv['date'] >= start) & (df_inv['date'] <= end)
             mask_bill = (df_bill['date'] >= start) & (df_bill['date'] <= end)
             
             dso = (df_inv.loc[mask_inv, 'bcy_balance'].sum() / (df_inv.loc[mask_inv, 'bcy_total'].sum() + 1)) * days
             dpo = (df_bill.loc[mask_bill, 'bcy_balance'].sum() / (df_bill.loc[mask_bill, 'bcy_total'].sum() + 1)) * days
             
-            # DIO (Inventory)
+            # DIO Logic (handles missing stock via Left Join)
             sales_mapped = pd.merge(df_sales, df_map, left_on='item_name', right_on='zoho_name', how='inner')
             inv_sum = df_wh.groupby('title').agg({'Qty':'sum', 'Value':'sum'}).reset_index()
             inv_sum['unit_cost'] = inv_sum['Value'] / (inv_sum['Qty'] + 0.001)
@@ -141,14 +145,14 @@ if all([f_inv, f_bill, f_sales, f_wh]):
             total_cogs = (final_df['quantity_sold'] * final_df['unit_cost']).sum()
             dio = (inv_sum['Value'].sum() / (total_cogs + 1)) * days
 
-            # Metrics
-            st.header(f"Performance Metrics: {start} to {end}")
+            # Display
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("DSO (Receivables)", f"{dso:.1f}")
-            m2.metric("DIO (Inventory)", f"{dio:.1f}")
-            m3.metric("DPO (Payables)", f"{dpo:.1f}")
-            m4.metric("Cash Cycle", f"{(dso + dio - dpo):.1f}")
+            m1.metric("Rec. Days (DSO)", f"{dso:.1f}")
+            m2.metric("Inv. Days (DIO)", f"{dio:.1f}")
+            m3.metric("Pay. Days (DPO)", f"{dpo:.1f}")
+            m4.metric("Cash Conversion Cycle", f"{(dso + dio - dpo):.1f}")
             
-            st.plotly_chart(px.bar(df_inv.loc[mask_inv].groupby('customer_name')['bcy_balance'].sum().nlargest(10).reset_index(), x='customer_name', y='bcy_balance'))
+            st.plotly_chart(px.bar(df_inv.loc[mask_inv].groupby('customer_name')['bcy_balance'].sum().nlargest(10).reset_index(), 
+                                   x='customer_name', y='bcy_balance', title="Top 10 AR Balances"))
 else:
-    st.info("Please upload your files to view the dashboard.")
+    st.info("Please upload your files in the sidebar.")
