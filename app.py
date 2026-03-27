@@ -25,6 +25,7 @@ with st.sidebar:
     st.header("🎯 Business Targets")
     target_dso = st.number_input("Target DSO (Days)", value=120)
     target_dio = st.number_input("Target DIO (Days)", value=45)
+    target_dpo = st.number_input("Target DPO (Days)", value=90)
     
     st.divider()
     st.header("📂 Data Ingestion")
@@ -45,30 +46,42 @@ if all([f_inv, f_bill, f_sales, f_wh]):
     days_in_period = (date_range[1] - date_range[0]).days or 365
 
     # 2. CORE CALCULATIONS
+    # DSO (Receivables)
     avg_dso = (df_inv['bcy_balance'].sum() / (df_inv['bcy_total'].sum() + 1)) * days_in_period
+    
+    # DPO (Payables) - RESTORED LOGIC
     avg_dpo = (df_bill['bcy_balance'].sum() / (df_bill['bcy_total'].sum() + 1)) * days_in_period
 
+    # DIO (Inventory)
     wh_sum = df_wh.groupby('title').agg({'Qty':'sum', 'Value':'sum'}).reset_index()
     wh_sum['unit_cost'] = wh_sum['Value'] / wh_sum['Qty'].replace(0, 1)
-    
     sales_mapped = pd.merge(df_sales, df_map, left_on='item_name', right_on='zoho_name', how='inner')
     dio_data = pd.merge(sales_mapped, wh_sum[['title', 'unit_cost']], left_on='inventory_title', right_on='title', how='left')
-    
     total_cogs = (dio_data['quantity_sold'] * dio_data['unit_cost'].fillna(0)).sum()
     avg_dio = (wh_sum['Value'].sum() / (total_cogs + 1)) * days_in_period
+    
+    # CCC (Cash Conversion Cycle)
     ccc = avg_dso + avg_dio - avg_dpo
+    
+    # Data Coverage for reliability check
+    total_sales_items = df_sales['item_name'].nunique()
+    mapped_items_count = len(df_map[df_map['zoho_name'].isin(df_sales['item_name'])])
+    coverage_pct = (mapped_items_count / total_sales_items) * 100 if total_sales_items > 0 else 0
 
     # --- TAB 1: DASHBOARD ---
     with tab_dash:
-        # Aggregate Metrics Row
+        # TOP ROW: ALL 4 WORKING CAPITAL PILLARS
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Current DSO", f"{avg_dso:.1f}d", f"{avg_dso - target_dso:+.1f}", delta_color="inverse")
-        m2.metric("Current DIO", f"{avg_dio:.1f}d", f"{avg_dio - target_dio:+.1f}", delta_color="inverse")
-        m3.metric("Data Coverage", "100.0%")
-        m4.metric("Cash Cycle (CCC)", f"{ccc:.1f}d")
+        m1.metric("DSO (Receivables)", f"{avg_dso:.1f}d", f"{avg_dso - target_dso:+.1f}", delta_color="inverse")
+        m2.metric("DIO (Inventory)", f"{avg_dio:.1f}d", f"{avg_dio - target_dio:+.1f}", delta_color="inverse")
+        m3.metric("DPO (Payables)", f"{avg_dpo:.1f}d", f"{avg_dpo - target_dpo:+.1f}")
+        m4.metric("Net Cash Cycle (CCC)", f"{ccc:.1f}d")
 
-        # PRODUCT DEEP DIVE (RESTORED VIEW)
+        # Status Bar
+        st.write(f"📈 **Data Confidence:** Mapping Coverage is at **{coverage_pct:.1f}%**")
         st.divider()
+
+        # PRODUCT DEEP DIVE
         st.subheader("🔍 Product Deep Dive")
         selected_product = st.selectbox("Select SKU to inspect:", ["All Products"] + sorted(wh_sum['title'].tolist()))
         
@@ -76,18 +89,14 @@ if all([f_inv, f_bill, f_sales, f_wh]):
             p_wh = wh_sum[wh_sum['title'] == selected_product].iloc[0]
             p_sales = dio_data[dio_data['inventory_title'] == selected_product]
             p_qty_sold = p_sales['quantity_sold'].sum()
-            p_cogs = (p_qty_sold * p_wh['unit_cost'])
-            p_dio = (p_wh['Value'] / (p_cogs + 1)) * days_in_period
+            p_dio = (p_wh['Value'] / ((p_qty_sold * p_wh['unit_cost']) + 1)) * days_in_period
             
-            # Restored 4-column metric view
             p1, p2, p3, p4 = st.columns(4)
             p1.metric("Stock Value", f"₹{p_wh['Value']:,.2f}")
             p2.metric("Qty on Hand", f"{p_wh['Qty']:,}")
             p3.metric("Units Sold", f"{p_qty_sold:,}")
             p4.metric("Product DIO", f"{p_dio:.1f} days")
-        else:
-            st.info("Aggregate data shown in top metrics. Select a product to see SKU-specific performance.")
-
+        
         # CEI BY CUSTOMER BAR CHART
         st.divider()
         st.subheader("💳 Collection Efficiency & AR by Customer")
@@ -100,13 +109,14 @@ if all([f_inv, f_bill, f_sales, f_wh]):
             cust_stats, x='customer_name', y='bcy_balance',
             text=cust_stats['CEI (%)'].apply(lambda x: f"CEI: {x:.1f}%"),
             title="Top 10 AR Balances with Collection Efficiency Index",
-            color='CEI (%)', color_continuous_scale='RdYlGn'
+            color='CEI (%)', color_continuous_scale='RdYlGn',
+            labels={'bcy_balance': 'Outstanding (BCY)', 'customer_name': 'Customer'}
         )
         st.plotly_chart(fig_cei, use_container_width=True)
 
-    # --- TAB 2: INVENTORY AGEING (MAINTAINED) ---
+    # --- TAB 2: INVENTORY AGEING ---
     with tab_ageing:
-        st.header("⏳ Inventory Ageing")
+        st.header("⏳ Inventory Health & Ageing")
         item_sales_vol = dio_data.groupby('inventory_title')['quantity_sold'].sum().reset_index()
         item_stats = pd.merge(wh_sum, item_sales_vol, left_on='title', right_on='inventory_title', how='left')
         item_stats['Item_DIO'] = (item_stats['Value'] / ((item_stats['quantity_sold'].fillna(0) * item_stats['unit_cost']) + 1)) * days_in_period
@@ -120,20 +130,20 @@ if all([f_inv, f_bill, f_sales, f_wh]):
         st.plotly_chart(px.pie(item_stats, values='Value', names='Bucket', hole=0.4), use_container_width=True)
         st.dataframe(item_stats[['title', 'Value', 'Item_DIO', 'Bucket']].sort_values('Value', ascending=False), use_container_width=True)
 
-    # --- TAB 3: MAPPINGS (MAINTAINED) ---
+    # --- TAB 3: MAPPINGS ---
     with tab_map:
         st.header("🔧 Mapping Management")
         with st.form("manual_map"):
             c1, c2 = st.columns(2)
-            z_name = c1.selectbox("Zoho Item", sorted(df_sales['item_name'].unique()))
+            z_name = c1.selectbox("Zoho Item Name", sorted(df_sales['item_name'].unique()))
             w_name = c2.selectbox("Warehouse SKU", sorted(wh_sum['title'].unique()))
             if st.form_submit_button("Save Mapping"):
                 with conn.session as s:
                     s.execute(text("INSERT INTO item_mappings (zoho_name, inventory_title) VALUES (:z, :i) ON CONFLICT (zoho_name) DO UPDATE SET inventory_title = EXCLUDED.inventory_title"), {"z": z_name, "i": w_name})
                     s.commit()
                 st.rerun()
-        st.subheader("Current Mappings")
+        st.subheader("Current Database")
         st.dataframe(df_map, use_container_width=True)
 
 else:
-    st.info("Upload your 4 CSV files to activate the dashboard.")
+    st.info("Upload your 4 CSV files in the sidebar to activate the dashboard.")
