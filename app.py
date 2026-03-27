@@ -1,143 +1,149 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
+from datetime import datetime
 
-# --- Configuration & DB Connection ---
+# --- 1. CONFIGURATION & DATABASE ---
 st.set_page_config(page_title="Working Capital Dashboard", layout="wide")
 
-# Database Connection (Neon Tech Postgres)
-# Setup in Streamlit Secrets: [connections.postgresql]
-def get_db_connection():
-    try:
-        # Uses Streamlit's built-in SQL connection
-        conn = st.connection("postgresql", type="sql")
-        return conn
-    except Exception as e:
-        st.error(f"Database connection failed: {e}")
-        return None
+def get_conn():
+    # Setup in Streamlit Secrets under [connections.postgresql]
+    return st.connection("postgresql", type="sql")
 
-# --- Helper Functions for Mapping Memory ---
-def load_mappings(conn):
-    if conn is not None:
-        try:
-            query = "SELECT zoho_name, inventory_title FROM item_mappings"
-            return conn.query(query)
-        except:
-            # Create table if it doesn't exist
-            with conn.session as s:
-                s.execute(text("CREATE TABLE IF NOT EXISTS item_mappings (zoho_name TEXT PRIMARY KEY, inventory_title TEXT)"))
-                s.commit()
-            return pd.DataFrame(columns=["zoho_name", "inventory_title"])
-    return pd.DataFrame(columns=["zoho_name", "inventory_title"])
+conn = get_conn()
 
-def save_mapping(conn, zoho_name, inv_title):
+# Initialize Database Tables
+def init_db():
     with conn.session as s:
-        s.execute(
-            text("INSERT INTO item_mappings (zoho_name, inventory_title) VALUES (:z, :i) ON CONFLICT (zoho_name) DO UPDATE SET inventory_title = :i"),
-            {"z": zoho_name, "i": inv_title}
-        )
+        s.execute(text("""
+            CREATE TABLE IF NOT EXISTS item_mappings (zoho_name TEXT PRIMARY KEY, inventory_title TEXT);
+            CREATE TABLE IF NOT EXISTS invoices (invoice_id BIGINT PRIMARY KEY, customer_name TEXT, bcy_total FLOAT, bcy_balance FLOAT, date DATE, due_date DATE);
+            CREATE TABLE IF NOT EXISTS bills (bill_id BIGINT PRIMARY KEY, vendor_name TEXT, bcy_total FLOAT, bcy_balance FLOAT, date DATE, due_date DATE);
+            CREATE TABLE IF NOT EXISTS sales_items (item_id BIGINT PRIMARY KEY, item_name TEXT, quantity_sold FLOAT, amount FLOAT, sku TEXT);
+        """))
         s.commit()
 
-# --- App UI ---
-st.title("🚀 Working Capital Dashboard")
-st.sidebar.header("Upload Data Sources")
+init_db()
 
-# File Uploaders
-ar_aging_file = st.sidebar.file_uploader("1. AR Aging Summary", type="csv")
-inv_details_file = st.sidebar.file_uploader("2. Invoice Details", type="csv")
-sales_item_file = st.sidebar.file_uploader("3. Sales by Item", type="csv")
-inventory_file = st.sidebar.file_uploader("4. Manual Inventory Export", type="csv")
-bill_details_file = st.sidebar.file_uploader("5. Bill Details", type="csv")
+# --- 2. DATA INGESTION (UPSERT LOGIC) ---
+def upsert_data(df, table_type):
+    with conn.session as s:
+        if table_type == 'invoices':
+            for _, r in df.iterrows():
+                s.execute(text("""
+                    INSERT INTO invoices (invoice_id, customer_name, bcy_total, bcy_balance, date, due_date)
+                    VALUES (:id, :n, :t, :b, :d, :dd)
+                    ON CONFLICT (invoice_id) DO UPDATE SET bcy_balance = EXCLUDED.bcy_balance
+                """), {"id": r['invoice_id'], "n": r['customer_name'], "t": r['bcy_total'], "b": r['bcy_balance'], "d": r['date'], "dd": r['due_date']})
+        
+        elif table_type == 'bills':
+            for _, r in df.iterrows():
+                s.execute(text("""
+                    INSERT INTO bills (bill_id, vendor_name, bcy_total, bcy_balance, date, due_date)
+                    VALUES (:id, :n, :t, :b, :d, :dd)
+                    ON CONFLICT (bill_id) DO UPDATE SET bcy_balance = EXCLUDED.bcy_balance
+                """), {"id": r['bill_id'], "n": r['vendor_name'], "t": r['bcy_total'], "b": r['bcy_balance'], "d": r['date'], "dd": r['due_date']})
+        
+        elif table_type == 'sales_items':
+            for _, r in df.iterrows():
+                s.execute(text("""
+                    INSERT INTO sales_items (item_id, item_name, quantity_sold, amount, sku)
+                    VALUES (:id, :n, :q, :a, :s)
+                    ON CONFLICT (item_id) DO UPDATE SET quantity_sold = EXCLUDED.quantity_sold, amount = EXCLUDED.amount
+                """), {"id": r['item_id'], "n": r['item_name'], "q": r['quantity_sold'], "a": r['amount'], "s": r['sku']})
+        s.commit()
 
-days_in_period = st.sidebar.number_input("Analysis Period (Days)", value=365)
+# --- 3. SIDEBAR: UPLOADS & FILTERS ---
+st.sidebar.header("📥 Data Management")
+with st.sidebar.expander("Upload Zoho Files"):
+    f_inv = st.file_uploader("Invoice Details", type="csv")
+    f_bill = st.file_uploader("Bill Details", type="csv")
+    f_sales = st.file_uploader("Sales by Item", type="csv")
+    if st.button("Sync Zoho to Database"):
+        if f_inv: upsert_data(pd.read_csv(f_inv), 'invoices')
+        if f_bill: upsert_data(pd.read_csv(f_bill), 'bills')
+        if f_sales: upsert_data(pd.read_csv(f_sales), 'sales_items')
+        st.toast("Database Updated!")
 
-conn = get_db_connection()
-mapping_df = load_mappings(conn)
+f_warehouse = st.sidebar.file_uploader("Warehouse Inventory (Manual)", type="csv")
 
-if all([ar_aging_file, inv_details_file, sales_item_file, inventory_file, bill_details_file]):
-    # Read Files
-    df_aging = pd.read_csv(ar_aging_file)
-    df_inv_details = pd.read_csv(inv_details_file)
-    df_sales_item = pd.read_csv(sales_item_file)
-    df_inventory = pd.read_csv(inventory_file)
-    df_bills = pd.read_csv(bill_details_file)
+st.sidebar.header("📅 Filters")
+date_range = st.sidebar.date_input("Analysis Period", [datetime(2025, 4, 1), datetime(2026, 3, 31)])
 
-    # --- PART 1: MAPPING LOGIC ---
-    st.header("🔗 Item Mapping & Memory")
+# --- 4. DATA RETRIEVAL & MAPPING ---
+# Fetch from DB based on filter
+start_date, end_date = date_range[0], date_range[1]
+df_invoices = conn.query(f"SELECT * FROM invoices WHERE date BETWEEN '{start_date}' AND '{end_date}'")
+df_bills = conn.query(f"SELECT * FROM bills WHERE date BETWEEN '{start_date}' AND '{end_date}'")
+df_sales_items = conn.query("SELECT * FROM sales_items")
+df_mappings = conn.query("SELECT * FROM item_mappings")
+
+if f_warehouse and not df_sales_items.empty:
+    df_warehouse_raw = pd.read_csv(f_warehouse)
     
-    # Clean column names
-    df_sales_item.columns = df_sales_item.columns.str.strip()
-    df_inventory.columns = df_inventory.columns.str.strip()
-    
-    # Identify unique Zoho items
-    zoho_items = df_sales_item['item_name'].unique()
-    inventory_titles = df_inventory['title'].unique()
-    
-    unmapped = [item for item in zoho_items if item not in mapping_df['zoho_name'].values]
-    
+    # Mapping Interface
+    unmapped = [n for n in df_sales_items['item_name'].unique() if n not in df_mappings['zoho_name'].values]
     if unmapped:
-        st.warning(f"Found {len(unmapped)} new unmapped items from Zoho.")
-        with st.expander("Map New Items"):
-            for item in unmapped:
-                col1, col2 = st.columns([2,1])
-                choice = col1.selectbox(f"Map '{item}' to:", inventory_titles, key=item)
-                if col2.button("Save", key=f"btn_{item}"):
-                    save_mapping(conn, item, choice)
+        st.warning(f"🔗 {len(unmapped)} items need mapping.")
+        with st.expander("Configure Item Mappings"):
+            options = list(df_warehouse_raw['title'].unique()) + ["DISCONTINUED / OLD SKU"]
+            for item in unmapped[:5]: # Show 5 at a time
+                col1, col2 = st.columns([3,1])
+                choice = col1.selectbox(f"Map '{item}'", options, key=item)
+                if col2.button("Save", key=f"b_{item}"):
+                    with conn.session as s:
+                        s.execute(text("INSERT INTO item_mappings VALUES (:z, :i)"), {"z":item, "i":choice})
+                        s.commit()
                     st.rerun()
-    else:
-        st.success("All items are mapped!")
 
-    # --- PART 2: CALCULATIONS ---
+    # --- 5. DASHBOARD CALCULATIONS ---
+    # Days in period for DSO/DIO/DPO calc
+    period_days = (end_date - start_date).days or 365
+
+    # A. Receivable Days (Customer Level)
+    dso_df = df_invoices.groupby('customer_name').agg({'bcy_total':'sum', 'bcy_balance':'sum'}).reset_index()
+    dso_df['DSO'] = (dso_df['bcy_balance'] / (dso_df['bcy_total'] + 0.1)) * period_days
+    avg_dso = (df_invoices['bcy_balance'].sum() / (df_invoices['bcy_total'].sum() + 0.1)) * period_days
+
+    # B. Payable Days (Vendor Level)
+    dpo_df = df_bills.groupby('vendor_name').agg({'bcy_total':'sum', 'bcy_balance':'sum'}).reset_index()
+    dpo_df['DPO'] = (dpo_df['bcy_balance'] / (dpo_df['bcy_total'] + 0.1)) * period_days
+    avg_dpo = (df_bills['bcy_balance'].sum() / (df_bills['bcy_total'].sum() + 0.1)) * period_days
+
+    # C. Inventory Days (Product Level)
+    sales_mapped = pd.merge(df_sales_items, df_mappings, left_on='item_name', right_on='zoho_name', how='left')
+    inv_sum = df_warehouse_raw.groupby('title').agg({'Qty':'sum', 'Value':'sum'}).reset_index()
+    # Add Discontinued Placeholder
+    inv_sum = pd.concat([inv_sum, pd.DataFrame([{'title':'DISCONTINUED / OLD SKU', 'Qty':0, 'Value':0}])])
+    inv_sum['unit_cost'] = inv_sum['Value'] / (inv_sum['Qty'] + 0.001)
     
-    # A. Receivable Days (DSO)
-    cust_sales = df_inv_details.groupby('customer_name')['bcy_total'].sum().reset_index()
-    ar_data = pd.merge(df_aging, cust_sales, on='customer_name', how='left')
-    ar_data['DSO'] = (ar_data['total'] / ar_data['bcy_total']) * days_in_period
-    avg_dso = ar_data['DSO'].mean()
+    dio_df = pd.merge(sales_mapped, inv_sum, left_on='inventory_title', right_on='title', how='left')
+    dio_df['COGS'] = dio_df['quantity_sold'] * dio_df['unit_cost']
+    avg_dio = (inv_sum['Value'].sum() / (dio_df['COGS'].sum() + 0.1)) * period_days
 
-    # B. Payable Days (DPO)
-    vendor_data = df_bills.groupby('vendor_name').agg({'bcy_total': 'sum', 'bcy_balance': 'sum'}).reset_index()
-    vendor_data['DPO'] = (vendor_data['bcy_balance'] / vendor_data['bcy_total']) * days_in_period
-    avg_dpo = vendor_data['DPO'].mean()
+    # --- 6. DISPLAY ---
+    st.header(f"Working Capital Summary: {start_date} to {end_date}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Receivable Days (DSO)", f"{avg_dso:.1f}")
+    c2.metric("Inventory Days (DIO)", f"{avg_dio:.1f}")
+    c3.metric("Payable Days (DPO)", f"{avg_dpo:.1f}")
+    c4.metric("Cash Conversion Cycle", f"{(avg_dso + avg_dio - avg_dpo):.1f}", delta_color="inverse")
 
-    # C. Inventory Days (DIO)
-    # Apply Mapping
-    df_sales_mapped = pd.merge(df_sales_item, mapping_df, left_on='item_name', right_on='zoho_name', how='left')
-    # Group inventory by title to get total value/qty
-    inv_summary = df_inventory.groupby('title').agg({'Qty': 'sum', 'Value': 'sum'}).reset_index()
-    inv_summary['unit_cost'] = inv_summary['Value'] / (inv_summary['Qty'] + 0.001)
+    tab1, tab2, tab3 = st.tabs(["Receivables", "Inventory Efficiency", "Payables"])
     
-    dio_data = pd.merge(df_sales_mapped, inv_summary, left_on='inventory_title', right_on='title', how='left')
-    dio_data['COGS'] = dio_data['quantity_sold'] * dio_data['unit_cost']
-    dio_data['DIO'] = (dio_data['Value'] / (dio_data['COGS'] + 0.1)) * days_in_period
-    avg_dio = dio_data['DIO'].mean()
-
-    # --- PART 3: VISUALIZATION ---
-    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-    kpi1.metric("Receivable Days (DSO)", f"{avg_dso:.1f} Days")
-    kpi2.metric("Inventory Days (DIO)", f"{avg_dio:.1f} Days")
-    kpi3.metric("Payable Days (DPO)", f"{avg_dpo:.1f} Days")
-    ccc = avg_dso + avg_dio - avg_dpo
-    kpi4.metric("Cash Conversion Cycle", f"{ccc:.1f} Days", delta_color="inverse")
-
-    tab1, tab2, tab3 = st.tabs(["Receivables (Customers)", "Inventory (Products)", "Payables (Vendors)"])
-
     with tab1:
-        st.subheader("Customer DSO Analysis")
-        fig_ar = px.bar(ar_data.sort_values('DSO', ascending=False).head(15), 
-                        x='customer_name', y='DSO', color='total', title="Top 15 Slowest Paying Customers")
+        fig_ar = px.bar(dso_df.sort_values('DSO', ascending=False).head(15), x='customer_name', y='DSO', title="Customer Credit Risk")
         st.plotly_chart(fig_ar, use_container_width=True)
-
+    
     with tab2:
-        st.subheader("Product Inventory Days")
-        fig_inv = px.scatter(dio_data, x='quantity_sold', y='DIO', size='Value', 
-                             hover_name='item_name', title="Sales Volume vs Inventory Days")
-        st.plotly_chart(fig_inv, use_container_width=True)
+        dio_df['DIO'] = (dio_df['Value'] / (dio_df['COGS'] + 0.1)) * period_days
+        st.subheader("Product Level Inventory Days")
+        st.dataframe(dio_df[['item_name', 'inventory_title', 'quantity_sold', 'Value', 'DIO']].sort_values('DIO', ascending=False))
 
     with tab3:
-        st.subheader("Vendor DPO Analysis")
-        st.dataframe(vendor_data.sort_values('DPO', ascending=False))
+        st.subheader("Vendor Payment Terms (DPO)")
+        st.dataframe(dpo_df.sort_values('DPO', ascending=False))
 
 else:
-    st.info("Waiting for all 5 CSV files to be uploaded to calculate the Working Capital Cycle.")
+    st.info("Sync your Zoho data in the sidebar and upload your Warehouse Inventory file to see the analysis.")
