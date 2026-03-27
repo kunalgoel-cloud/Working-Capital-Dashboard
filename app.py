@@ -12,7 +12,7 @@ def get_conn():
 conn = get_conn()
 
 # ─────────────────────────────────────────────
-# 1. DATABASE INITIALIZATION
+# 1. DATABASE INITIALIZATION + MIGRATION
 # ─────────────────────────────────────────────
 def init_db():
     with conn.session as s:
@@ -31,6 +31,21 @@ def init_db():
             bill_id TEXT, vendor_name TEXT, bcy_balance FLOAT, bcy_total FLOAT,
             bill_date DATE, snapshot_date DATE,
             PRIMARY KEY (bill_id, snapshot_date));"""))
+        
+        # MIGRATION: Add bill_date column if it doesn't exist (for old tables)
+        try:
+            s.execute(text("""
+                DO $$ 
+                BEGIN 
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                                  WHERE table_name='bills_history' AND column_name='bill_date') THEN
+                        ALTER TABLE bills_history ADD COLUMN bill_date DATE;
+                    END IF;
+                END $$;
+            """))
+        except Exception as e:
+            st.warning(f"Migration note: {e}")
+        
         s.commit()
 
 init_db()
@@ -63,8 +78,6 @@ def safe_div(num, den, fallback=0.0):
 
 # ─────────────────────────────────────────────
 # 4. SYNC ENGINE
-#    KEY FIX: inventory is pre-aggregated by title before archiving
-#    so that ON CONFLICT doesn't overwrite partial batches with single rows
 # ─────────────────────────────────────────────
 def sync_to_db(df, mode):
     today = datetime.now().date()
@@ -81,7 +94,7 @@ def sync_to_db(df, mode):
         if count > 0:
             st.warning(f"⚠️ {mode.capitalize()} snapshot for {today} already exists ({count} rows). Re-archiving will overwrite.")
 
-    # ── PRE-AGGREGATE inventory so each title appears once ──
+    # Pre-aggregate inventory so each title appears once
     if mode == "inventory":
         df = df.groupby("title", as_index=False).agg({"Qty": "sum", "Value": "sum"})
 
@@ -120,10 +133,10 @@ def sync_to_db(df, mode):
                             (bill_id, vendor_name, bcy_balance, bcy_total, bill_date, snapshot_date)
                             VALUES (:id, :v, :bal, :tot, :bd, :d)
                             ON CONFLICT (bill_id, snapshot_date) DO UPDATE
-                            SET bcy_balance=EXCLUDED.bcy_balance, bcy_total=EXCLUDED.bcy_total""")
+                            SET bcy_balance=EXCLUDED.bcy_balance, bcy_total=EXCLUDED.bcy_total, bill_date=EXCLUDED.bill_date""")
                 p = {"id": str(row["bill_number"]), "v": row["vendor_name"],
                      "bal": row["bcy_balance"], "tot": row["bcy_total"],
-                     "bd": pd.to_datetime(row["date"]).date(), "d": today}
+                     "bd": pd.to_datetime(row["date"]).date() if pd.notna(row["date"]) else None, "d": today}
             s.execute(q, p)
             if i % 100 == 0:
                 prog.progress(int((i + 1) / total_rows * 100))
@@ -176,6 +189,8 @@ with st.sidebar:
         df_b["date"] = pd.to_datetime(df_b["date"], errors="coerce")
         if not validate_csv(df_b, REQUIRED_COLS["bills"], "Bill Details"):
             df_b = None
+        elif st.button("Archive Bills"):
+            sync_to_db(df_b, "bills")
 
     st.divider()
     date_range = st.date_input(
@@ -185,12 +200,10 @@ with st.sidebar:
 
 # ─────────────────────────────────────────────
 # 6. HISTORIC SNAPSHOT SELECTOR
-#    Lets user load a past snapshot from DB instead of uploading fresh files
 # ─────────────────────────────────────────────
 st.sidebar.divider()
 st.sidebar.subheader("🗄️ Load Historic Snapshot")
 
-# Fetch available snapshot dates across all tables
 try:
     snap_inv = conn.query("SELECT DISTINCT snapshot_date FROM inventory_history ORDER BY snapshot_date DESC", ttl=0)
     snap_cust = conn.query("SELECT DISTINCT snapshot_date FROM customer_history ORDER BY snapshot_date DESC", ttl=0)
@@ -234,28 +247,50 @@ else:
 # ─────────────────────────────────────────────
 # 7. LOAD DATA — from DB snapshot OR uploaded files
 # ─────────────────────────────────────────────
+load_error = None
+
 if use_historic:
-    # Use raw psycopg2 connection to avoid SQLAlchemy version incompatibilities
-    _raw = conn.session.connection().connection
-    _cur = _raw.cursor()
+    try:
+        # Use SQLAlchemy connection instead of raw psycopg2 for better compatibility
+        def fetch_historic(query, params=None):
+            try:
+                if params:
+                    return conn.query(query, params=params, ttl=0)
+                return conn.query(query, ttl=0)
+            except Exception as e:
+                nonlocal load_error
+                load_error = str(e)
+                return pd.DataFrame()
 
-    def _fetch(sql, params):
-        _cur.execute(sql, params)
-        cols = [desc[0] for desc in _cur.description]
-        return pd.DataFrame(_cur.fetchall(), columns=cols)
-
-    df_s  = _fetch("SELECT * FROM customer_history WHERE snapshot_date = %s", (hist_date,))
-    df_wh = _fetch('SELECT sku_title AS title, qty AS "Qty", value AS "Value" FROM inventory_history WHERE snapshot_date = %s', (hist_date,))
-    df_sl = _fetch("SELECT * FROM sales_history WHERE snapshot_date = %s", (hist_date,))
-    df_b  = _fetch("SELECT bill_id, vendor_name, bcy_balance, bcy_total, bill_date AS date, snapshot_date FROM bills_history WHERE snapshot_date = %s", (hist_date,))
-    _cur.close()
-    df_b["date"] = pd.to_datetime(df_b["date"], errors="coerce")
-    st.info(f"📦 Showing archived snapshot from **{hist_date}**. Upload new files to see today's data.")
+        df_s = fetch_historic("SELECT * FROM customer_history WHERE snapshot_date = :date", {"date": hist_date})
+        df_wh = fetch_historic('SELECT sku_title AS title, qty AS "Qty", value AS "Value" FROM inventory_history WHERE snapshot_date = :date', {"date": hist_date})
+        df_sl = fetch_historic("SELECT * FROM sales_history WHERE snapshot_date = :date", {"date": hist_date})
+        
+        # Handle potential missing bill_date column gracefully
+        try:
+            df_b = fetch_historic("SELECT bill_id, vendor_name, bcy_balance, bcy_total, bill_date AS date, snapshot_date FROM bills_history WHERE snapshot_date = :date", {"date": hist_date})
+        except Exception:
+            # Fallback to query without bill_date if column is missing
+            df_b = fetch_historic("SELECT bill_id, vendor_name, bcy_balance, bcy_total, snapshot_date FROM bills_history WHERE snapshot_date = :date", {"date": hist_date})
+            if not df_b.empty and "date" not in df_b.columns:
+                df_b["date"] = pd.NaT
+        
+        if not df_b.empty and "date" in df_b.columns:
+            df_b["date"] = pd.to_datetime(df_b["date"], errors="coerce")
+            
+        st.info(f"📦 Showing archived snapshot from **{hist_date}**.")
+        
+        if load_error:
+            st.error(f"⚠️ Error loading some data: {load_error}")
+            
+    except Exception as e:
+        st.error(f"Failed to load historic snapshot: {e}")
+        data_ready = False
 
 data_ready = all([df_s is not None and len(df_s) > 0,
                   df_wh is not None and len(df_wh) > 0,
                   df_sl is not None and len(df_sl) > 0,
-                  df_b  is not None and len(df_b) > 0])
+                  df_b is not None and len(df_b) > 0])
 
 # ─────────────────────────────────────────────
 # 8. MAIN TABS
@@ -265,54 +300,40 @@ t1, t2, t3, t4, t5 = st.tabs(["📊 Dashboard", "📈 Trends", "⏳ Ageing", "�
 if data_ready:
     df_map = conn.query("SELECT * FROM item_mappings", ttl=0)
 
-    # ── Days in analysis period ──
+    # Days in analysis period
     start_date = pd.Timestamp(date_range[0])
-    end_date   = pd.Timestamp(date_range[1])
+    end_date = pd.Timestamp(date_range[1])
     days = max((end_date - start_date).days, 1)
 
-    # ── Filter bills by date range (only file with dates) ──
-    df_b["date"] = pd.to_datetime(df_b["date"], errors="coerce")
-    df_b_filtered = df_b[(df_b["date"] >= start_date) & (df_b["date"] <= end_date)]
-    if df_b_filtered.empty:
-        st.warning("⚠️ No bills in selected date range — using all bills.")
+    # Filter bills by date range
+    if "date" in df_b.columns:
+        df_b["date"] = pd.to_datetime(df_b["date"], errors="coerce")
+        df_b_filtered = df_b[(df_b["date"] >= start_date) & (df_b["date"] <= end_date)]
+        if df_b_filtered.empty:
+            st.warning("⚠️ No bills in selected date range — using all bills.")
+            df_b_filtered = df_b
+    else:
         df_b_filtered = df_b
 
-    # ── Warehouse: aggregate by title (critical: raw file has multiple rows per title) ──
+    # Warehouse: aggregate by title
     wh_sum = df_wh.groupby("title", as_index=False).agg({"Qty": "sum", "Value": "sum"})
     wh_sum["unit_cost"] = wh_sum.apply(lambda r: safe_div(r["Value"], r["Qty"]), axis=1)
 
-    # ────────────────────────────────────────────────────────────────────────
-    # DSO FORMULA
-    #   Standard: DSO = (Accounts Receivable / Credit Sales) × Days
-    #   We use: closing_balance = AR outstanding; invoiced_amount = credit sales proxy
-    #   IMPROVEMENT: exclude customers with invoiced_amount <= 0 (B2C/advance cases)
-    #   where invoiced_amount=0 inflates the AR numerator without a denominator match
-    # ────────────────────────────────────────────────────────────────────────
+    # DSO Calculation
     df_s_b2b = df_s[(df_s["invoiced_amount"] > 0) & (df_s["closing_balance"] > 0)].copy()
-    total_ar        = df_s_b2b["closing_balance"].sum()
-    total_invoiced  = df_s_b2b["invoiced_amount"].sum()
+    total_ar = df_s_b2b["closing_balance"].sum()
+    total_invoiced = df_s_b2b["invoiced_amount"].sum()
     avg_dso = safe_div(total_ar, total_invoiced) * days
 
-    # ────────────────────────────────────────────────────────────────────────
-    # DPO FORMULA
-    #   Standard: DPO = (Accounts Payable / COGS or Purchases) × Days
-    #   bcy_balance = outstanding payable; bcy_total = total purchase bill value
-    # ────────────────────────────────────────────────────────────────────────
-    total_ap        = df_b_filtered["bcy_balance"].sum()
+    # DPO Calculation
+    total_ap = df_b_filtered["bcy_balance"].sum()
     total_purchases = df_b_filtered["bcy_total"].sum()
     avg_dpo = safe_div(total_ap, total_purchases) * days
 
-    # ────────────────────────────────────────────────────────────────────────
-    # DIO FORMULA
-    #   Standard: DIO = (Average Inventory / COGS) × Days
-    #   We use: current inventory value / estimated COGS from mapped sales
-    #   COGS = Σ (quantity_sold × unit_cost) for mapped items
-    #   Numerator uses ALL inventory; denominator uses MAPPED items only
-    #   → Show unmapped warning so user can fix mappings
-    # ────────────────────────────────────────────────────────────────────────
+    # DIO Calculation
     sales_mapped = pd.merge(df_sl, df_map, left_on="item_name", right_on="zoho_name", how="left")
-    unmapped     = sales_mapped[sales_mapped["inventory_title"].isna()]
-    mapped       = sales_mapped[sales_mapped["inventory_title"].notna()]
+    unmapped = sales_mapped[sales_mapped["inventory_title"].isna()]
+    mapped = sales_mapped[sales_mapped["inventory_title"].notna()]
 
     dio_data = pd.merge(
         mapped,
@@ -320,16 +341,14 @@ if data_ready:
         left_on="inventory_title", right_on="title",
         how="left"
     )
-    total_cogs     = (dio_data["quantity_sold"] * dio_data["unit_cost"].fillna(0)).sum()
-    total_inv_val  = wh_sum["Value"].sum()
+    total_cogs = (dio_data["quantity_sold"] * dio_data["unit_cost"].fillna(0)).sum()
+    total_inv_val = wh_sum["Value"].sum()
     avg_dio = safe_div(total_inv_val, total_cogs) * days
 
-    # ── Cash Conversion Cycle ──
+    # Cash Conversion Cycle
     ccc = avg_dso + avg_dio - avg_dpo
 
-    # ── CEI: Collection Efficiency Index ──
-    # Standard: CEI = (Received / Invoiced) × 100, capped at 100%
-    # Only meaningful for customers with invoiced_amount > 0
+    # CEI Calculation
     df_s["CEI"] = df_s.apply(
         lambda r: min(safe_div(r["amount_received"], r["invoiced_amount"]) * 100, 100.0)
         if r["invoiced_amount"] > 0 else 0.0,
@@ -340,7 +359,6 @@ if data_ready:
     # TAB 1: DASHBOARD
     # ─────────────────────────────────────────
     with t1:
-        # Unmapped warning at top if relevant
         if len(unmapped) > 0:
             unmapped_val = unmapped["amount"].sum() if "amount" in unmapped.columns else 0
             st.warning(
@@ -349,12 +367,11 @@ if data_ready:
             )
 
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("DSO",        f"{avg_dso:.1f}d",  f"{avg_dso - t_dso:+.1f}d",  "inverse")
-        m2.metric("DIO",        f"{avg_dio:.1f}d",  f"{avg_dio - t_dio:+.1f}d",  "inverse")
-        m3.metric("DPO",        f"{avg_dpo:.1f}d",  f"{avg_dpo - t_dpo:+.1f}d")
+        m1.metric("DSO", f"{avg_dso:.1f}d", f"{avg_dso - t_dso:+.1f}d", "inverse")
+        m2.metric("DIO", f"{avg_dio:.1f}d", f"{avg_dio - t_dio:+.1f}d", "inverse")
+        m3.metric("DPO", f"{avg_dpo:.1f}d", f"{avg_dpo - t_dpo:+.1f}d")
         m4.metric("Cash Cycle", f"{ccc:.1f}d")
 
-        # Metric explanation expander
         with st.expander("ℹ️ How metrics are calculated"):
             st.markdown(f"""
 | Metric | Formula | Values used |
@@ -371,18 +388,18 @@ if data_ready:
         sel_p = st.selectbox("Search SKU:", ["All Products"] + product_list)
 
         if sel_p != "All Products":
-            p_w     = wh_sum[wh_sum["title"] == sel_p].iloc[0]
+            p_w = wh_sum[wh_sum["title"] == sel_p].iloc[0]
             p_s_qty = dio_data[dio_data["inventory_title"] == sel_p]["quantity_sold"].sum()
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Current Value", f"₹{p_w['Value']:,.0f}")
-            c2.metric("Stock Qty",     f"{p_w['Qty']:,.0f}")
-            c3.metric("Units Sold",    f"{p_s_qty:,.0f}")
+            c2.metric("Stock Qty", f"{p_w['Qty']:,.0f}")
+            c3.metric("Units Sold", f"{p_s_qty:,.0f}")
             if p_s_qty == 0:
                 c4.metric("SKU DIO", "N/A")
                 st.warning("⚠️ No mapped sales for this SKU — go to Mappings tab.")
             else:
                 p_cogs = p_s_qty * p_w["unit_cost"]
-                p_dio  = safe_div(p_w["Value"], p_cogs) * days
+                p_dio = safe_div(p_w["Value"], p_cogs) * days
                 c4.metric("SKU DIO", f"{p_dio:.1f}d")
 
         st.divider()
@@ -401,7 +418,7 @@ if data_ready:
     # ─────────────────────────────────────────
     with t2:
         st.header("📈 Historical Trends")
-        st.caption("Charts populate as you archive daily snapshots. Inventory value now reflects aggregated totals.")
+        st.caption("Charts populate as you archive daily snapshots.")
 
         try:
             debt_trend = conn.query(
@@ -462,7 +479,7 @@ if data_ready:
         st.subheader("📦 Inventory Risk Ageing (by DIO)")
 
         item_sales_vol = dio_data.groupby("inventory_title")["quantity_sold"].sum().reset_index()
-        item_stats     = pd.merge(wh_sum, item_sales_vol, left_on="title", right_on="inventory_title", how="left")
+        item_stats = pd.merge(wh_sum, item_sales_vol, left_on="title", right_on="inventory_title", how="left")
         item_stats["quantity_sold"] = item_stats["quantity_sold"].fillna(0)
         item_stats["Item_DIO"] = item_stats.apply(
             lambda r: safe_div(r["Value"], r["quantity_sold"] * r["unit_cost"]) * days
@@ -475,8 +492,8 @@ if data_ready:
 
         def get_bucket(d):
             if d == float("inf"): return "⚫ Unmapped"
-            if d <= 30:  return "🟢 Fast (≤30d)"
-            if d <= 90:  return "🟡 Healthy (31–90d)"
+            if d <= 30: return "🟢 Fast (≤30d)"
+            if d <= 90: return "🟡 Healthy (31–90d)"
             return "🔴 High Risk (>90d)"
 
         item_stats["Bucket"] = item_stats["Item_DIO"].apply(get_bucket)
@@ -501,8 +518,8 @@ if data_ready:
         ar_buckets = df_s[df_s["closing_balance"] > 0].copy()
         ar_buckets["Risk"] = ar_buckets["CEI"].apply(
             lambda c: "🟢 Well Collected (≥90%)" if c >= 90
-                 else "🟡 At Risk (50–89%)"      if c >= 50
-                 else "🔴 Overdue (<50%)"
+            else "🟡 At Risk (50–89%)" if c >= 50
+            else "🔴 Overdue (<50%)"
         )
         c1, c2 = st.columns([1, 2])
         with c1:
@@ -519,24 +536,23 @@ if data_ready:
             )
 
     # ─────────────────────────────────────────
-    # TAB 4: DB INSPECTOR  ← NEW
+    # TAB 4: DB INSPECTOR
     # ─────────────────────────────────────────
     with t4:
         st.header("🗄️ Database Inspector")
         st.caption("Check what's stored in PostgreSQL across all archive tables.")
 
         tables = {
-            "customer_history":  "customer_history",
+            "customer_history": "customer_history",
             "inventory_history": "inventory_history",
-            "sales_history":     "sales_history",
-            "bills_history":     "bills_history",
-            "item_mappings":     "item_mappings",
+            "sales_history": "sales_history",
+            "bills_history": "bills_history",
+            "item_mappings": "item_mappings",
         }
 
         for table_label, table_name in tables.items():
             with st.expander(f"📋 {table_label}", expanded=(table_label == "inventory_history")):
                 try:
-                    # Snapshot date coverage
                     if table_name != "item_mappings":
                         snap_df = conn.query(
                             f"SELECT snapshot_date, COUNT(*) as rows, "
@@ -548,11 +564,10 @@ if data_ready:
                             st.info("No data archived yet.")
                         else:
                             col_label = "Total Value" if table_name == "inventory_history" else \
-                                        "Total AR"    if table_name == "customer_history" else "Row Count"
+                                "Total AR" if table_name == "customer_history" else "Row Count"
                             snap_df.columns = ["Snapshot Date", "Rows", col_label]
                             st.dataframe(snap_df, use_container_width=True)
 
-                            # Preview latest snapshot
                             latest = snap_df["Snapshot Date"].iloc[0]
                             prev = conn.query(f"SELECT * FROM {table_name} WHERE snapshot_date = '{latest}' LIMIT 20", ttl=0)
                             st.caption(f"Preview of latest snapshot ({latest}):")
@@ -564,10 +579,11 @@ if data_ready:
                 except Exception as e:
                     st.error(f"Query failed: {e}")
 
-        # Quick SQL runner
         st.divider()
         st.subheader("🔍 Custom SQL Query")
-        sql_input = st.text_area("Run a SELECT query:", value="SELECT snapshot_date, SUM(value) as total_value FROM inventory_history GROUP BY snapshot_date ORDER BY snapshot_date DESC;", height=80)
+        sql_input = st.text_area("Run a SELECT query:", 
+                                value="SELECT snapshot_date, SUM(value) as total_value FROM inventory_history GROUP BY snapshot_date ORDER BY snapshot_date DESC;", 
+                                height=80)
         if st.button("Run Query"):
             try:
                 result = conn.query(sql_input, ttl=0)
@@ -583,7 +599,7 @@ if data_ready:
         st.subheader("🔧 Item Mappings (Zoho Sales → Warehouse SKU)")
         with st.form("map_form"):
             z = st.selectbox("Zoho Item Name", sorted(df_sl["item_name"].unique()))
-            w = st.selectbox("Warehouse SKU",  sorted(wh_sum["title"].unique()))
+            w = st.selectbox("Warehouse SKU", sorted(wh_sum["title"].unique()))
             if st.form_submit_button("Save Mapping"):
                 with conn.session as s:
                     s.execute(
