@@ -55,14 +55,16 @@ if f_inv and f_bill and f_sales and f_wh:
     current_ar = df_inv['bcy_balance'].sum()
     avg_dso = (current_ar / (total_sales + 1)) * days_in_period
     
-    # 2. Inventory Logic
+    # 2. Inventory Logic (FIXED NameError here)
     wh_sum = df_wh.groupby('title').agg({'Qty':'sum', 'Value':'sum'}).reset_index()
-    wh_sum['unit_cost'] = wh_sum['Value'] / wh_summary['Qty'].replace(0, 1) if 'Qty' in wh_sum else 0
+    wh_sum['unit_cost'] = wh_sum['Value'] / wh_sum['Qty'].replace(0, 1)
     
     # Merge Sales + Mapping to get COGS
     sales_mapped = pd.merge(df_sales, df_map, left_on='item_name', right_on='zoho_name', how='inner')
     dio_data = pd.merge(sales_mapped, wh_sum, left_on='inventory_title', right_on='title', how='left')
-    total_cogs = (dio_data['quantity_sold'] * (dio_data['Value'] / dio_data['Qty'].replace(0,1))).sum()
+    
+    # Use actual unit costs for COGS calculation
+    total_cogs = (dio_data['quantity_sold'] * dio_data['unit_cost']).sum()
     avg_dio = (wh_sum['Value'].sum() / (total_cogs + 1)) * days_in_period
 
     # --- TAB 1: DASHBOARD ---
@@ -83,36 +85,46 @@ if f_inv and f_bill and f_sales and f_wh:
         df_inv['month'] = df_inv['date'].dt.strftime('%Y-%m')
         m_trend = df_inv.groupby('month').agg({'bcy_total':'sum', 'bcy_balance':'sum'}).reset_index()
         m_trend['DSO'] = (m_trend['bcy_balance'] / (m_trend['bcy_total'] + 1)) * 30
-        st.plotly_chart(px.line(m_trend, x='month', y='DSO', markers=True), use_container_width=True)
+        st.plotly_chart(px.line(m_trend, x='month', y='DSO', markers=True, title="DSO over Time"), use_container_width=True)
 
-    # --- TAB 3: INVENTORY AGEING (NEW) ---
+    # --- TAB 3: INVENTORY AGEING ---
     with tab_ageing:
         st.header("📦 Inventory Ageing Analysis")
-        st.caption("Categorizing stock based on turnover velocity (DIO per Item).")
+        st.caption("Categorizing stock based on individual Item DIO (Inventory Turn).")
         
-        # Calculate DIO for every individual SKU
-        item_ageing = dio_data.groupby('inventory_title').agg({'quantity_sold':'sum', 'Value':'sum', 'Qty':'sum'}).reset_index()
-        item_ageing['Item_DIO'] = (item_ageing['Value'] / ((item_ageing['quantity_sold'] * (item_ageing['Value']/item_ageing['Qty'].replace(0,1))) + 1)) * days_in_period
+        # Calculate individual item velocity
+        item_ageing = dio_data.groupby('inventory_title').agg({'quantity_sold':'sum', 'Value':'sum', 'Qty':'sum', 'unit_cost':'mean'}).reset_index()
+        item_ageing['Item_COGS'] = item_ageing['quantity_sold'] * item_ageing['unit_cost']
+        item_ageing['Item_DIO'] = (item_ageing['Value'] / (item_ageing['Item_COGS'] + 1)) * days_in_period
         
-        # Bucketing
+        # Bucketing Logic
         def bucket_age(d):
             if d <= 30: return "0-30 Days (Fast)"
             if d <= 60: return "31-60 Days (Healthy)"
             if d <= 90: return "61-90 Days (Slow)"
-            return "90+ Days (At Risk)"
+            return "90+ Days (High Risk)"
             
         item_ageing['Ageing Bucket'] = item_ageing['Item_DIO'].apply(bucket_age)
         
-        # Summary View
+        # Visuals
         age_summary = item_ageing.groupby('Ageing Bucket')['Value'].sum().reset_index()
-        fig_age = px.pie(age_summary, values='Value', names='Ageing Bucket', color_discrete_sequence=px.colors.sequential.RdBu_r)
+        fig_age = px.pie(age_summary, values='Value', names='Ageing Bucket', hole=0.4,
+                         color_discrete_map={
+                             "0-30 Days (Fast)": "#2ecc71",
+                             "31-60 Days (Healthy)": "#3498db",
+                             "61-90 Days (Slow)": "#f1c40f",
+                             "90+ Days (High Risk)": "#e74c3c"
+                         })
         
         c1, c2 = st.columns([1, 2])
         c1.plotly_chart(fig_age, use_container_width=True)
         with c2:
-            st.subheader("High Risk Inventory (90+ Days)")
-            at_risk = item_ageing[item_ageing['Ageing Bucket'] == "90+ Days (At Risk)"].sort_values('Value', ascending=False)
-            st.dataframe(at_risk[['inventory_title', 'Value', 'Item_DIO']], use_container_width=True)
+            st.subheader("Inventory Value by Category")
+            st.dataframe(age_summary, use_container_width=True)
+
+        st.divider()
+        st.subheader("🔍 At-Risk Stock Detail (90+ Days)")
+        st.dataframe(item_ageing[item_ageing['Ageing Bucket'] == "90+ Days (High Risk)"].sort_values('Value', ascending=False), use_container_width=True)
 
     # --- TAB 4: MAPPINGS ---
     with tab_map:
@@ -120,4 +132,4 @@ if f_inv and f_bill and f_sales and f_wh:
         st.dataframe(df_map, use_container_width=True)
 
 else:
-    st.info("Upload CSV files to generate Ageing Analysis.")
+    st.info("Upload CSV files to generate Dashboard and Ageing Analysis.")
