@@ -393,18 +393,29 @@ if data_ready:
         st.header("📈 Historical Trends")
         st.caption("Charts populate as you archive daily snapshots. Inventory value now reflects aggregated totals.")
 
-        debt_trend = conn.query(
-            "SELECT snapshot_date, SUM(closing_balance) as total_ar, SUM(invoiced_amount) as total_invoiced "
-            "FROM customer_history GROUP BY snapshot_date ORDER BY snapshot_date", ttl=3600
-        )
-        inv_trend = conn.query(
-            "SELECT snapshot_date, SUM(value) as total_inventory "
-            "FROM inventory_history GROUP BY snapshot_date ORDER BY snapshot_date", ttl=3600
-        )
-        bills_trend = conn.query(
-            "SELECT snapshot_date, SUM(bcy_balance) as total_ap, SUM(bcy_total) as total_purchases "
-            "FROM bills_history GROUP BY snapshot_date ORDER BY snapshot_date", ttl=3600
-        )
+        try:
+            debt_trend = conn.query(
+                "SELECT snapshot_date, SUM(closing_balance) as total_ar, SUM(invoiced_amount) as total_invoiced "
+                "FROM customer_history GROUP BY snapshot_date ORDER BY snapshot_date", ttl=0
+            )
+        except Exception:
+            debt_trend = pd.DataFrame()
+
+        try:
+            inv_trend = conn.query(
+                "SELECT snapshot_date, SUM(value) as total_inventory "
+                "FROM inventory_history GROUP BY snapshot_date ORDER BY snapshot_date", ttl=0
+            )
+        except Exception:
+            inv_trend = pd.DataFrame()
+
+        try:
+            bills_trend = conn.query(
+                "SELECT snapshot_date, SUM(bcy_balance) as total_ap, SUM(bcy_total) as total_purchases "
+                "FROM bills_history GROUP BY snapshot_date ORDER BY snapshot_date", ttl=0
+            )
+        except Exception:
+            bills_trend = pd.DataFrame()
 
         c1, c2 = st.columns(2)
         with c1:
