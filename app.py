@@ -40,8 +40,10 @@ with st.sidebar:
 # --- TABS ---
 tab_dash, tab_insights, tab_ageing, tab_map = st.tabs(["📊 Dashboard", "💡 Trends & Actions", "⏳ Inventory Ageing", "🔧 Mappings"])
 
-if f_inv and f_bill and f_sales and f_wh:
+if all([f_inv, f_bill, f_sales, f_wh]):
+    # 1. Load Data
     df_inv = pd.read_csv(f_inv)
+    df_bill = pd.read_csv(f_bill)
     df_sales = pd.read_csv(f_sales)
     df_wh = pd.read_csv(f_wh)
     df_map = conn.query("SELECT * FROM item_mappings", ttl=0)
@@ -50,20 +52,20 @@ if f_inv and f_bill and f_sales and f_wh:
     df_inv['date'] = pd.to_datetime(df_inv['date'])
     days_in_period = (date_range[1] - date_range[0]).days or 365
 
-    # 1. Dashboard Calculations
+    # 2. Performance Metrics
     total_sales = df_inv['bcy_total'].sum()
     current_ar = df_inv['bcy_balance'].sum()
     avg_dso = (current_ar / (total_sales + 1)) * days_in_period
     
-    # 2. Inventory Logic (FIXED NameError here)
+    # 3. Inventory Logic (Fixed wh_sum reference)
     wh_sum = df_wh.groupby('title').agg({'Qty':'sum', 'Value':'sum'}).reset_index()
     wh_sum['unit_cost'] = wh_sum['Value'] / wh_sum['Qty'].replace(0, 1)
     
     # Merge Sales + Mapping to get COGS
     sales_mapped = pd.merge(df_sales, df_map, left_on='item_name', right_on='zoho_name', how='inner')
     dio_data = pd.merge(sales_mapped, wh_sum, left_on='inventory_title', right_on='title', how='left')
+    dio_data['unit_cost'] = dio_data['unit_cost'].fillna(wh_sum['unit_cost'].mean() or 0)
     
-    # Use actual unit costs for COGS calculation
     total_cogs = (dio_data['quantity_sold'] * dio_data['unit_cost']).sum()
     avg_dio = (wh_sum['Value'].sum() / (total_cogs + 1)) * days_in_period
 
@@ -79,25 +81,18 @@ if f_inv and f_bill and f_sales and f_wh:
         m2.metric("Current DIO", f"{avg_dio:.1f} Days", f"{avg_dio - target_dio:+.1f} vs Goal", delta_color="inverse")
         m3.metric("Total AR Balance", f"₹{current_ar:,.0f}")
 
-    # --- TAB 2: TRENDS & ACTIONS ---
-    with tab_insights:
-        st.subheader("Monthly Collection Trend")
-        df_inv['month'] = df_inv['date'].dt.strftime('%Y-%m')
-        m_trend = df_inv.groupby('month').agg({'bcy_total':'sum', 'bcy_balance':'sum'}).reset_index()
-        m_trend['DSO'] = (m_trend['bcy_balance'] / (m_trend['bcy_total'] + 1)) * 30
-        st.plotly_chart(px.line(m_trend, x='month', y='DSO', markers=True, title="DSO over Time"), use_container_width=True)
+        st.subheader("📋 Top Customer Balances (Sortable)")
+        cust_table = df_inv.groupby('customer_name').agg({'bcy_balance':'sum', 'bcy_total':'sum'}).reset_index()
+        st.dataframe(cust_table.sort_values('bcy_balance', ascending=False), use_container_width=True)
 
     # --- TAB 3: INVENTORY AGEING ---
     with tab_ageing:
         st.header("📦 Inventory Ageing Analysis")
-        st.caption("Categorizing stock based on individual Item DIO (Inventory Turn).")
         
-        # Calculate individual item velocity
-        item_ageing = dio_data.groupby('inventory_title').agg({'quantity_sold':'sum', 'Value':'sum', 'Qty':'sum', 'unit_cost':'mean'}).reset_index()
-        item_ageing['Item_COGS'] = item_ageing['quantity_sold'] * item_ageing['unit_cost']
-        item_ageing['Item_DIO'] = (item_ageing['Value'] / (item_ageing['Item_COGS'] + 1)) * days_in_period
+        # Calculate individual SKU velocity
+        item_ageing = dio_data.groupby('inventory_title').agg({'quantity_sold':'sum', 'Value':'sum', 'unit_cost':'mean'}).reset_index()
+        item_ageing['Item_DIO'] = (item_ageing['Value'] / ((item_ageing['quantity_sold'] * item_ageing['unit_cost']) + 1)) * days_in_period
         
-        # Bucketing Logic
         def bucket_age(d):
             if d <= 30: return "0-30 Days (Fast)"
             if d <= 60: return "31-60 Days (Healthy)"
@@ -106,7 +101,7 @@ if f_inv and f_bill and f_sales and f_wh:
             
         item_ageing['Ageing Bucket'] = item_ageing['Item_DIO'].apply(bucket_age)
         
-        # Visuals
+        # Charts
         age_summary = item_ageing.groupby('Ageing Bucket')['Value'].sum().reset_index()
         fig_age = px.pie(age_summary, values='Value', names='Ageing Bucket', hole=0.4,
                          color_discrete_map={
@@ -119,17 +114,16 @@ if f_inv and f_bill and f_sales and f_wh:
         c1, c2 = st.columns([1, 2])
         c1.plotly_chart(fig_age, use_container_width=True)
         with c2:
-            st.subheader("Inventory Value by Category")
-            st.dataframe(age_summary, use_container_width=True)
+            st.subheader("Inventory Distribution")
+            st.dataframe(age_summary.sort_values('Value', ascending=False), use_container_width=True)
 
         st.divider()
-        st.subheader("🔍 At-Risk Stock Detail (90+ Days)")
+        st.subheader("🔍 At-Risk Stock Detail (Sorted by Value)")
         st.dataframe(item_ageing[item_ageing['Ageing Bucket'] == "90+ Days (High Risk)"].sort_values('Value', ascending=False), use_container_width=True)
 
     # --- TAB 4: MAPPINGS ---
     with tab_map:
-        st.header("Mapping Management")
+        st.header("Manage Mappings")
         st.dataframe(df_map, use_container_width=True)
-
 else:
-    st.info("Upload CSV files to generate Dashboard and Ageing Analysis.")
+    st.info("Please upload all 4 CSV files to generate the dashboard and ageing report.")
