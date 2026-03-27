@@ -51,15 +51,15 @@ if all([f_inv, f_bill, f_sales, f_wh]):
     avg_dso = (df_inv['bcy_balance'].sum() / (df_inv['bcy_total'].sum() + 1)) * days_in_period
     avg_dpo = (df_bill['bcy_balance'].sum() / (df_bill['bcy_total'].sum() + 1)) * days_in_period
 
-    # Inventory Logic (Fixed wh_sum column names)
+    # Inventory Logic
     wh_sum = df_wh.groupby('title').agg({'Qty':'sum', 'Value':'sum'}).reset_index()
     wh_sum['unit_cost'] = wh_sum['Value'] / wh_sum['Qty'].replace(0, 1)
     
-    # Mapping Logic
+    # Mapping Join
     sales_mapped = pd.merge(df_sales, df_map, left_on='item_name', right_on='zoho_name', how='left')
     dio_data = pd.merge(sales_mapped, wh_sum[['title', 'unit_cost']], left_on='inventory_title', right_on='title', how='left')
     
-    # Ensure COGS uses the joined unit cost safely
+    # Safety: Fill missing unit costs to avoid math errors
     dio_data['unit_cost'] = dio_data['unit_cost'].fillna(0)
     total_cogs = (dio_data['quantity_sold'] * dio_data['unit_cost']).sum()
     avg_dio = (wh_sum['Value'].sum() / (total_cogs + 1)) * days_in_period
@@ -80,22 +80,23 @@ if all([f_inv, f_bill, f_sales, f_wh]):
             st.markdown("### 🔴 Collections Focus")
             top_debtor = df_inv.groupby('customer_name')['bcy_balance'].sum().idxmax()
             top_val = df_inv.groupby('customer_name')['bcy_balance'].sum().max()
-            st.write(f"Prioritize **{top_debtor}** (₹{top_val:,.0f} outstanding).")
+            st.write(f"Prioritize **{top_debtor}** (₹{top_val:,.0f} outstanding). Bringing DSO down to {target_dso} days is your fastest cash lever.")
         with c2:
             st.markdown("### 🟡 Inventory Focus")
-            st.write(f"Total Working Capital tied in Stock: **₹{wh_sum['Value'].sum():,.0f}**.")
+            st.write(f"Total Working Capital tied in Stock: **₹{wh_sum['Value'].sum():,.0f}**. High DIO suggests slow-moving SKUs.")
 
         cust_bal = df_inv.groupby('customer_name')['bcy_balance'].sum().reset_index().sort_values('bcy_balance', ascending=False).head(10)
-        st.plotly_chart(px.bar(cust_bal, x='customer_name', y='bcy_balance', title="Top 10 AR Balances"), use_container_width=True)
+        st.plotly_chart(px.bar(cust_bal, x='customer_name', y='bcy_balance', title="Top 10 AR Balances", color_discrete_sequence=['#004d99']), use_container_width=True)
 
     # --- TAB 2: INVENTORY AGEING (FIXED KeyError Logic) ---
     with tab_ageing:
         st.header("⏳ Inventory Health & Ageing")
-        # Pre-calculate item turnover without messy multi-merges
+        
+        # Calculate item turnover safely
         item_sales_vol = dio_data.groupby('inventory_title')['quantity_sold'].sum().reset_index()
         item_stats = pd.merge(wh_sum, item_sales_vol, left_on='title', right_on='inventory_title', how='left')
         
-        # Calculate Individual Item DIO
+        # Use the unit_cost calculated in wh_sum
         item_stats['Item_DIO'] = (item_stats['Value'] / ((item_stats['quantity_sold'].fillna(0) * item_stats['unit_cost']) + 1)) * days_in_period
         
         def bucket_age(d):
@@ -106,12 +107,16 @@ if all([f_inv, f_bill, f_sales, f_wh]):
         
         item_stats['Ageing Bucket'] = item_stats['Item_DIO'].apply(bucket_age)
         
-        fig_age = px.pie(item_stats, values='Value', names='Ageing Bucket', hole=0.4, 
-                         color_discrete_map={"0-30 Days (Fast)": "#2ecc71", "31-60 Days (Healthy)": "#3498db", "61-90 Days (Slow)": "#f1c40f", "90+ Days (High Risk)": "#e74c3c"})
-        st.plotly_chart(fig_age, use_container_width=True)
-        st.dataframe(item_stats[['title', 'Qty', 'Value', 'Item_DIO', 'Ageing Bucket']].sort_values('Value', ascending=False), use_container_width=True)
+        col_chart, col_table = st.columns([1, 2])
+        with col_chart:
+            fig_age = px.pie(item_stats, values='Value', names='Ageing Bucket', hole=0.4, 
+                             color_discrete_map={"0-30 Days (Fast)": "#2ecc71", "31-60 Days (Healthy)": "#3498db", "61-90 Days (Slow)": "#f1c40f", "90+ Days (High Risk)": "#e74c3c"})
+            st.plotly_chart(fig_age, use_container_width=True)
+        
+        with col_table:
+            st.dataframe(item_stats[['title', 'Qty', 'Value', 'Item_DIO', 'Ageing Bucket']].sort_values('Value', ascending=False), use_container_width=True)
 
-    # --- TAB 3: MAPPINGS (WITH BULK SUGGESTIONS) ---
+    # --- TAB 3: MAPPINGS (WITH BULK TOOL) ---
     with tab_map:
         st.header("🔧 Mapping Management")
         
@@ -119,7 +124,7 @@ if all([f_inv, f_bill, f_sales, f_wh]):
         
         if unmapped:
             st.subheader("⚡ Bulk Suggestion Tool")
-            st.info(f"Found {len(unmapped)} unmapped Zoho items.")
+            st.info(f"Found {len(unmapped)} unmapped Zoho items. Suggestions are based on name similarity.")
             
             suggestions = []
             wh_titles = wh_sum['title'].tolist()
@@ -140,8 +145,20 @@ if all([f_inv, f_bill, f_sales, f_wh]):
                 st.rerun()
 
         st.divider()
-        st.subheader("Existing Mappings")
+        st.subheader("Manual Mapping Editor")
+        with st.expander("Update / Add Single Mapping"):
+            col_a, col_b = st.columns(2)
+            z_name = col_a.selectbox("Zoho Item Name", sorted(df_sales['item_name'].unique()))
+            w_name = col_b.selectbox("Warehouse SKU Name", sorted(wh_sum['title'].unique()))
+            if st.button("Save Mapping"):
+                with conn.session as s:
+                    s.execute(text("INSERT INTO item_mappings (zoho_name, inventory_title) VALUES (:z, :i) ON CONFLICT (zoho_name) DO UPDATE SET inventory_title = EXCLUDED.inventory_title"), 
+                              {"z": z_name, "i": w_name})
+                    s.commit()
+                st.rerun()
+
+        st.subheader("Current Mapping Table")
         st.dataframe(df_map, use_container_width=True)
 
 else:
-    st.info("Please upload your data files to get started.")
+    st.info("👋 Welcome! Please upload your 4 CSV files to activate the dashboard.")
