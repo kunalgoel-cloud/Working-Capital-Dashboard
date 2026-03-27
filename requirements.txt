@@ -1,5 +1,5 @@
-streamlit
-pandas
-plotly
-sqlalchemy
-psycopg2-binary
+streamlit>=1.35.0
+pandas>=2.0.0
+plotly>=5.18.0
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
