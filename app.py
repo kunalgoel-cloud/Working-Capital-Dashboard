@@ -235,12 +235,20 @@ else:
 # 7. LOAD DATA — from DB snapshot OR uploaded files
 # ─────────────────────────────────────────────
 if use_historic:
-    with conn.session as _s:
-        _d = {"d": hist_date}
-        df_s  = pd.DataFrame(_s.execute(text("SELECT * FROM customer_history WHERE snapshot_date = :d"), _d).mappings().all())
-        df_wh = pd.DataFrame(_s.execute(text('SELECT sku_title AS title, qty AS "Qty", value AS "Value" FROM inventory_history WHERE snapshot_date = :d'), _d).mappings().all())
-        df_sl = pd.DataFrame(_s.execute(text("SELECT * FROM sales_history WHERE snapshot_date = :d"), _d).mappings().all())
-        df_b  = pd.DataFrame(_s.execute(text("SELECT bill_id, vendor_name, bcy_balance, bcy_total, bill_date AS date, snapshot_date FROM bills_history WHERE snapshot_date = :d"), _d).mappings().all())
+    # Use raw psycopg2 connection to avoid SQLAlchemy version incompatibilities
+    _raw = conn.session.connection().connection
+    _cur = _raw.cursor()
+
+    def _fetch(sql, params):
+        _cur.execute(sql, params)
+        cols = [desc[0] for desc in _cur.description]
+        return pd.DataFrame(_cur.fetchall(), columns=cols)
+
+    df_s  = _fetch("SELECT * FROM customer_history WHERE snapshot_date = %s", (hist_date,))
+    df_wh = _fetch('SELECT sku_title AS title, qty AS "Qty", value AS "Value" FROM inventory_history WHERE snapshot_date = %s', (hist_date,))
+    df_sl = _fetch("SELECT * FROM sales_history WHERE snapshot_date = %s", (hist_date,))
+    df_b  = _fetch("SELECT bill_id, vendor_name, bcy_balance, bcy_total, bill_date AS date, snapshot_date FROM bills_history WHERE snapshot_date = %s", (hist_date,))
+    _cur.close()
     df_b["date"] = pd.to_datetime(df_b["date"], errors="coerce")
     st.info(f"📦 Showing archived snapshot from **{hist_date}**. Upload new files to see today's data.")
 
