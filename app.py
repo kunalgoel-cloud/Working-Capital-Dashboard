@@ -3,7 +3,6 @@ import pandas as pd
 import plotly.express as px
 from sqlalchemy import text
 from datetime import datetime
-from difflib import get_close_matches
 
 st.set_page_config(page_title="Working Capital Dash", layout="wide")
 
@@ -28,8 +27,8 @@ with st.sidebar:
     
     st.divider()
     st.header("💰 Cash Forecast Inputs")
-    current_cash = st.number_input("Current Bank Balance (BCY)", value=500000)
-    monthly_fixed_costs = st.number_input("Monthly Fixed Costs (Rent, Salaries, etc.)", value=150000)
+    current_cash = st.number_input("Current Bank Balance", value=500000)
+    monthly_fixed_costs = st.number_input("Monthly Fixed Costs", value=150000)
     
     st.divider()
     st.header("🔮 What-If Analysis")
@@ -43,8 +42,8 @@ with st.sidebar:
     date_range = st.date_input("Analysis Period", [pd.to_datetime("2025-04-01"), pd.to_datetime("2026-03-31")])
 
 # --- TABS ---
-tabs = st.tabs(["📊 Dashboard", "💡 Trends & Actions", "⏳ Inventory Ageing", "📉 Cash Runway", "🔧 Mappings"])
-tab_dash, tab_insights, tab_ageing, tab_runway, tab_map = tabs
+tabs = st.tabs(["📊 Dashboard", "⏳ Inventory Ageing", "📉 Cash Runway", "✉️ Debtor Alerts", "🔧 Mappings"])
+tab_dash, tab_ageing, tab_runway, tab_alerts, tab_map = tabs
 
 if all([f_inv, f_bill, f_sales, f_wh]):
     # 1. Load Data
@@ -61,7 +60,7 @@ if all([f_inv, f_bill, f_sales, f_wh]):
     current_ar = df_inv['bcy_balance'].sum()
     avg_dso = (current_ar / (total_sales + 1)) * days_in_period
     
-    # 3. Inventory & COGS
+    # 3. Inventory Logic (FIXED: Consistently using wh_sum)
     wh_sum = df_wh.groupby('title').agg({'Qty':'sum', 'Value':'sum'}).reset_index()
     wh_sum['unit_cost'] = wh_sum['Value'] / wh_sum['Qty'].replace(0, 1)
     
@@ -76,55 +75,52 @@ if all([f_inv, f_bill, f_sales, f_wh]):
     with tab_dash:
         daily_sales = total_sales / days_in_period
         cash_unlock = max(0, current_ar - (daily_sales * what_if_dso))
-        st.info(f"💰 **Strategic Opportunity:** Achieving your {what_if_dso}d DSO target would unlock **₹{cash_unlock:,.2f}** in cash.")
+        st.info(f"💰 **Opportunity:** Hitting your {what_if_dso}d target would unlock **₹{cash_unlock:,.2f}**")
         
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("DSO", f"{avg_dso:.1f}d", f"{avg_dso - target_dso:+.1f}", delta_color="inverse")
-        m2.metric("DIO", f"{avg_dio:.1f}d", f"{avg_dio - target_dio:+.1f}", delta_color="inverse")
-        m3.metric("CCC", f"{avg_dso + avg_dio - 90:.1f}d")
-        
-        # Simple Runway Calculation for Dashboard
-        avg_monthly_collections = (total_sales - current_ar) / (days_in_period / 30)
-        avg_monthly_spend = (df_bill['bcy_total'].sum() / (days_in_period / 30)) + monthly_fixed_costs
-        net_burn = avg_monthly_spend - avg_monthly_collections
-        runway_months = current_cash / net_burn if net_burn > 0 else 12 # Cap at 12 for display
-        
-        m4.metric("Est. Runway", f"{runway_months:.1f} Mo", delta="Critical" if runway_months < 3 else "Healthy")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Current DSO", f"{avg_dso:.1f}d", f"{avg_dso - target_dso:+.1f}", delta_color="inverse")
+        m2.metric("Current DIO", f"{avg_dio:.1f}d", f"{avg_dio - target_dio:+.1f}", delta_color="inverse")
+        m3.metric("Total AR", f"₹{current_ar:,.0f}")
 
-    # --- TAB 4: CASH RUNWAY (NEW) ---
+        st.subheader("Top Debtor Impacts")
+        cust_table = df_inv.groupby('customer_name').agg({'bcy_balance':'sum'}).reset_index()
+        st.dataframe(cust_table.sort_values('bcy_balance', ascending=False), use_container_width=True)
+
+    # --- TAB 3: CASH RUNWAY ---
     with tab_runway:
-        st.header("📉 Cash Runway & Burn Analysis")
+        st.header("📉 Cash Runway Analysis")
+        avg_monthly_coll = (total_sales - current_ar) / (days_in_period / 30)
+        avg_monthly_spend = (df_bill['bcy_total'].sum() / (days_in_period / 30)) + monthly_fixed_costs
+        net_burn = avg_monthly_spend - avg_monthly_coll
+        runway = current_cash / net_burn if net_burn > 0 else 12
         
-        c1, c2 = st.columns(2)
-        with c1:
-            st.write(f"**Average Monthly Spend:** ₹{avg_monthly_spend:,.2f}")
-            st.write(f"**Average Monthly Collections:** ₹{avg_monthly_collections:,.2f}")
-            st.write(f"**Net Monthly Burn:** ₹{net_burn:,.2f}")
+        st.metric("Monthly Net Burn", f"₹{net_burn:,.2f}", delta="Negative Burn" if net_burn < 0 else "Burning Cash", delta_color="inverse")
         
-        # Forecast Dataframe
-        forecast_months = []
-        remaining_cash = current_cash
-        for i in range(1, 7):
-            remaining_cash -= net_burn
-            forecast_months.append({"Month": i, "Projected Cash": max(0, remaining_cash)})
-        
-        df_forecast = pd.DataFrame(forecast_months)
-        fig_runway = px.area(df_forecast, x='Month', y='Projected Cash', title="6-Month Cash Projection")
-        st.plotly_chart(fig_runway, use_container_width=True)
-        
-        if net_burn > 0:
-            st.warning(f"⚠️ Based on current trends, your business has approximately **{runway_months:.1f} months** of cash remaining.")
-        else:
-            st.success("✅ Your collections are currently exceeding your spend. Your runway is infinite at this rate!")
+        forecast = [{"Month": i, "Cash": max(0, current_cash - (net_burn * i))} for i in range(7)]
+        st.plotly_chart(px.area(pd.DataFrame(forecast), x='Month', y='Cash', title="6-Month Projection"))
 
-    # --- OTHER TABS (Simplified for brevity) ---
+    # --- TAB 4: DEBTOR ALERTS ---
+    with tab_alerts:
+        st.header("✉️ Automated Collection Drafts")
+        top_debtor = cust_table.sort_values('bcy_balance', ascending=False).iloc[0]
+        st.subheader(f"Draft for {top_debtor['customer_name']}")
+        email_body = f"""
+        Subject: Outstanding Balance Notice - ₹{top_debtor['bcy_balance']:,.2f}
+        
+        Dear Finance Team,
+        
+        Our records show an outstanding balance of ₹{top_debtor['bcy_balance']:,.2f}. 
+        As we are streamlining our working capital for the new quarter, 
+        we would appreciate a status update on this payment.
+        """
+        st.text_area("Copy and send:", email_body, height=200)
+
+    # --- TAB 2: INVENTORY AGEING ---
     with tab_ageing:
         st.header("⏳ Inventory Ageing")
-        st.write("See previous code for full Item DIO bucketing logic.")
-
-    with tab_map:
-        st.header("🔧 Mappings")
-        st.dataframe(df_map, use_container_width=True)
+        item_ageing = dio_data.groupby('inventory_title').agg({'quantity_sold':'sum', 'Value':'sum', 'unit_cost':'mean'}).reset_index()
+        item_ageing['Item_DIO'] = (item_ageing['Value'] / ((item_ageing['quantity_sold'] * item_ageing['unit_cost']) + 1)) * days_in_period
+        st.dataframe(item_ageing.sort_values('Value', ascending=False), use_container_width=True)
 
 else:
-    st.info("Please upload all 4 CSV files to generate the Runway Forecast.")
+    st.info("Upload all 4 CSV files to view the fixed dashboard and runway forecast.")
