@@ -247,7 +247,7 @@ else:
 # ─────────────────────────────────────────────
 # 7. LOAD DATA — from DB snapshot OR uploaded files
 # ─────────────────────────────────────────────
-load_error = None
+load_errors = []
 
 if use_historic:
     try:
@@ -258,8 +258,7 @@ if use_historic:
                     return conn.query(query, params=params, ttl=0)
                 return conn.query(query, ttl=0)
             except Exception as e:
-                nonlocal load_error
-                load_error = str(e)
+                load_errors.append(str(e))
                 return pd.DataFrame()
 
         df_s = fetch_historic("SELECT * FROM customer_history WHERE snapshot_date = :date", {"date": hist_date})
@@ -280,8 +279,8 @@ if use_historic:
             
         st.info(f"📦 Showing archived snapshot from **{hist_date}**.")
         
-        if load_error:
-            st.error(f"⚠️ Error loading some data: {load_error}")
+        if load_errors:
+            st.error(f"⚠️ Errors loading data: {'; '.join(load_errors)}")
             
     except Exception as e:
         st.error(f"Failed to load historic snapshot: {e}")
