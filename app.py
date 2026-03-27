@@ -104,7 +104,7 @@ if all([f_sum, f_wh, f_sales, f_bill]):
     # DSO Calculation (Ledger Truth)
     avg_dso = (df_sum['closing_balance'].sum() / (df_sum['invoiced_amount'].sum() + 1)) * days
     
-    # DPO Calculation (Restored)
+    # DPO Calculation
     avg_dpo = (df_bill['bcy_balance'].sum() / (df_bill['bcy_total'].sum() + 1)) * days
     
     # DIO Calculation
@@ -117,7 +117,7 @@ if all([f_sum, f_wh, f_sales, f_bill]):
     
     # CCC
     ccc = avg_dso + avg_dio - avg_dpo
-    coverage = (len(df_map[df_map['zoho_name'].isin(df_sales['item_name'])]) / df_sales['item_name'].nunique()) * 100
+    coverage = (len(df_map[df_map['zoho_name'].isin(df_sales['item_name'])]) / df_sales['item_name'].nunique()) * 100 if df_sales['item_name'].nunique() > 0 else 0
 
     # --- MAIN TABS ---
     t1, t2, t3 = st.tabs(["📊 Dashboard", "⏳ Ageing", "🔧 Mappings"])
@@ -137,20 +137,19 @@ if all([f_sum, f_wh, f_sales, f_bill]):
         sel_p = st.selectbox("Select SKU to inspect:", ["All Products"] + sorted(wh_sum['title'].tolist()))
         if sel_p != "All Products":
             p_w = wh_sum[wh_sum['title'] == sel_p].iloc[0]
-            p_s = dio_data[dio_data['inventory_title'] == sel_p]['quantity_sold'].sum()
-            p_d = (p_w['Value'] / ((p_s * p_w['unit_cost']) + 1)) * days
+            p_s_data = dio_data[dio_data['inventory_title'] == sel_p]
+            p_s_qty = p_s_data['quantity_sold'].sum()
+            p_d = (p_w['Value'] / ((p_s_qty * p_w['unit_cost']) + 1)) * days
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Stock Value", f"₹{p_w['Value']:,.2f}")
             c2.metric("Qty on Hand", f"{p_w['Qty']:,}")
-            c3.metric("Units Sold", f"{p_s:,}")
+            c3.metric("Units Sold", f"{p_s_qty:,}")
             c4.metric("Product DIO", f"{p_d:.1f} days")
 
-        # Row 3: CEI Chart (WITH SHAPE ERROR FIX)
+        # Row 3: CEI Chart
         st.divider()
         st.subheader("💳 Collection Efficiency Index (CEI)")
         df_sum['CEI'] = (df_sum['amount_received'] / (df_sum['invoiced_amount'] + 1)) * 100
-        
-        # Fixing the Narwhals ShapeError by creating a clean copy of the top 10
         top_10 = df_sum.sort_values('closing_balance', ascending=False).head(10).copy()
         
         fig_cei = px.bar(
@@ -171,8 +170,13 @@ if all([f_sum, f_wh, f_sales, f_bill]):
         item_sales_vol = dio_data.groupby('inventory_title')['quantity_sold'].sum().reset_index()
         item_stats = pd.merge(wh_sum, item_sales_vol, left_on='title', right_on='inventory_title', how='left')
         item_stats['Item_DIO'] = (item_stats['Value'] / ((item_stats['quantity_sold'].fillna(0) * item_stats['unit_cost']) + 1)) * days
-        def get_bucket(d): return "Fast" if d <= 30 else "Healthy" if d <= 90 else "High Risk"
-        item_stats['Bucket'] = item_stats['Item_DIO'].apply(get_b)
+        
+        # FIXED: Function name consistency (get_bucket)
+        def get_bucket(d): 
+            return "Fast" if d <= 30 else "Healthy" if d <= 90 else "High Risk"
+            
+        item_stats['Bucket'] = item_stats['Item_DIO'].apply(get_bucket)
+        
         st.plotly_chart(px.pie(item_stats, values='Value', names='Bucket', hole=0.4), use_container_width=True)
         st.dataframe(item_stats[['title', 'Value', 'Item_DIO', 'Bucket']].sort_values('Value', ascending=False))
 
@@ -190,4 +194,4 @@ if all([f_sum, f_wh, f_sales, f_bill]):
         st.dataframe(df_map, use_container_width=True)
 
 else:
-    st.info("Upload the 4 required CSV files to activate the engine.")
+    st.info("Upload the 4 required CSV files to activate the dashboard.")
