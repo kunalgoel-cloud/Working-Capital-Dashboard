@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.express as px
 from sqlalchemy import text
 import time
+from difflib import get_close_matches
 
 st.set_page_config(page_title="Working Capital Dashboard", layout="wide")
 
@@ -39,18 +40,18 @@ if all([f_inv, f_bill, f_sales, f_wh]):
     df_bill = pd.read_csv(f_bill)
     df_sales = pd.read_csv(f_sales)
     df_wh = pd.read_csv(f_wh)
-    
-    # Load mappings from Postgres
     df_map = conn.query("SELECT * FROM item_mappings")
 
     with tab_map:
         st.header("Mapping Management")
         
-        # Section A: New Mappings
+        # Section A: New Mappings with Fuzzy Logic
         unmapped = [n for n in df_sales['item_name'].unique() if n not in df_map['zoho_name'].values]
         
         if unmapped:
             st.subheader(f"Unmapped Items ({len(unmapped)})")
+            st.info("The system has automatically suggested matches based on name similarity.")
+            
             if st.button("⚡ Bulk Mark All Unmapped as Discontinued"):
                 with conn.session as s:
                     for item in unmapped:
@@ -60,50 +61,71 @@ if all([f_inv, f_bill, f_sales, f_wh]):
                 st.success("Bulk mapping complete!")
                 st.rerun()
 
-            opts = list(df_wh['title'].unique()) + ["DISCONTINUED / OLD SKU"]
-            for item in unmapped[:5]: # Batch of 5 for speed
+            warehouse_titles = list(df_wh['title'].unique())
+            opts = warehouse_titles + ["DISCONTINUED / OLD SKU"]
+            
+            for item in unmapped[:10]: # Batch of 10 for better workflow
                 c1, c2 = st.columns([3, 1])
-                choice = c1.selectbox(f"Map '{item}'", opts, key=f"new_{item}")
+                
+                # --- FUZZY LOGIC START ---
+                # Finds the closest match from warehouse titles
+                matches = get_close_matches(item, warehouse_titles, n=1, cutoff=0.3)
+                default_val = matches[0] if matches else "DISCONTINUED / OLD SKU"
+                # --- FUZZY LOGIC END ---
+                
+                choice = c1.selectbox(f"Map '{item}'", opts, index=opts.index(default_val), key=f"new_{item}")
+                
                 if c2.button("Save Mapping", key=f"btn_{item}"):
                     with conn.session as s:
                         s.execute(text("INSERT INTO item_mappings VALUES (:z, :i) ON CONFLICT (zoho_name) DO UPDATE SET inventory_title = EXCLUDED.inventory_title"), {"z":item, "i":choice})
                         s.commit()
-                    st.toast(f"Saved: {item}", icon="✅")
-                    time.sleep(0.5)
+                    st.toast(f"Linked to: {choice}", icon="✅")
+                    time.sleep(0.3)
                     st.rerun()
         else:
-            st.success("All items are currently mapped!")
+            st.success("All items from your sales report are successfully mapped!")
 
         st.divider()
         
         # Section B: Edit Existing Mappings
-        st.subheader("Edit Existing Mappings")
-        search_term = st.text_input("Search mapped items...")
+        st.subheader("Edit / Review Existing Mappings")
+        search_term = st.text_input("Search mapped items to edit...")
         
         display_map = df_map.copy()
         if search_term:
             display_map = display_map[display_map['zoho_name'].str.contains(search_term, case=False)]
         
-        for idx, row in display_map.iterrows():
-            c1, c2, c3 = st.columns([3, 3, 1])
-            c1.text(row['zoho_name'])
-            new_choice = c2.selectbox("Update to:", opts, index=opts.index(row['inventory_title']) if row['inventory_title'] in opts else 0, key=f"edit_{row['zoho_name']}")
-            if c3.button("Update", key=f"upd_{row['zoho_name']}"):
-                with conn.session as s:
-                    s.execute(text("UPDATE item_mappings SET inventory_title = :i WHERE zoho_name = :z"), {"i":new_choice, "z":row['zoho_name']})
-                    s.commit()
-                st.toast("Updated successfully!")
-                st.rerun()
+        if not display_map.empty:
+            for idx, row in display_map.head(20).iterrows(): # Limits list to 20 for performance
+                c1, c2, c3 = st.columns([3, 3, 1])
+                c1.markdown(f"**Zoho:** {row['zoho_name']}")
+                
+                # Pre-set the dropdown to currently saved value
+                current_opts = list(df_wh['title'].unique()) + ["DISCONTINUED / OLD SKU"]
+                current_idx = current_opts.index(row['inventory_title']) if row['inventory_title'] in current_opts else 0
+                
+                new_choice = c2.selectbox("Change to:", current_opts, index=current_idx, key=f"edit_{row['zoho_name']}")
+                
+                if c3.button("Update", key=f"upd_{row['zoho_name']}"):
+                    with conn.session as s:
+                        s.execute(text("UPDATE item_mappings SET inventory_title = :i WHERE zoho_name = :z"), {"i":new_choice, "z":row['zoho_name']})
+                        s.commit()
+                    st.toast("Updated!")
+                    st.rerun()
+        else:
+            st.write("No mappings found matching that search.")
 
     with tab_dash:
-        if not unmapped or st.checkbox("Show Dashboard with partial data"):
+        # Check if we should block the dashboard
+        if not unmapped or st.checkbox("Show Dashboard with current mappings"):
             days = (date_range[1] - date_range[0]).days or 365
             
-            # DSO/DPO
+            # DSO/DPO Logic
             avg_dso = (df_inv['bcy_balance'].sum() / (df_inv['bcy_total'].sum() + 1)) * days
             avg_dpo = (df_bill['bcy_balance'].sum() / (df_bill['bcy_total'].sum() + 1)) * days
             
-            # DIO
+            # DIO Logic
+            # Only use items that are actually mapped in the DB
             sales_mapped = pd.merge(df_sales, df_map, left_on='item_name', right_on='zoho_name', how='inner')
             inv_sum = df_wh.groupby('title').agg({'Qty':'sum', 'Value':'sum'}).reset_index()
             inv_sum = pd.concat([inv_sum, pd.DataFrame([{'title':'DISCONTINUED / OLD SKU','Qty':0,'Value':0}])])
@@ -113,16 +135,16 @@ if all([f_inv, f_bill, f_sales, f_wh]):
             total_cogs = (dio_merge['quantity_sold'] * dio_merge['cost']).sum()
             avg_dio = (inv_sum['Value'].sum() / (total_cogs + 1)) * days
 
-            st.header("Working Capital Summary")
+            st.header(f"Dashboard ({start_date} to {end_date})")
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Receivable Days (DSO)", f"{avg_dso:.1f}")
-            m2.metric("Inventory Days (DIO)", f"{avg_dio:.1f}")
-            m3.metric("Payable Days (DPO)", f"{avg_dpo:.1f}")
-            m4.metric("Cash Cycle", f"{(avg_dso + avg_dio - avg_dpo):.1f}")
+            m1.metric("Rec. Days (DSO)", f"{avg_dso:.1f}")
+            m2.metric("Inv. Days (DIO)", f"{avg_dio:.1f}")
+            m3.metric("Pay. Days (DPO)", f"{avg_dpo:.1f}")
+            m4.metric("Cash Conversion Cycle", f"{(avg_dso + avg_dio - avg_dpo):.1f}")
             
             st.plotly_chart(px.bar(df_inv.groupby('customer_name')['bcy_balance'].sum().nlargest(10).reset_index(), 
                                    x='customer_name', y='bcy_balance', title="Top 10 AR Balances"))
         else:
-            st.info("Go to the 'Manage Mappings' tab to link your items and unlock the dashboard.")
+            st.info(f"Please map the remaining {len(unmapped)} items in the 'Manage Mappings' tab.")
 else:
-    st.info("Please upload your files in the sidebar to begin.")
+    st.info("Awaiting file uploads in the sidebar.")
