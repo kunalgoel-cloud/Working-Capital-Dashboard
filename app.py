@@ -51,14 +51,15 @@ if all([f_inv, f_bill, f_sales, f_wh]):
     avg_dso = (df_inv['bcy_balance'].sum() / (df_inv['bcy_total'].sum() + 1)) * days_in_period
     avg_dpo = (df_bill['bcy_balance'].sum() / (df_bill['bcy_total'].sum() + 1)) * days_in_period
 
-    # Inventory Logic
+    # Inventory Logic (Fixed wh_sum column names)
     wh_sum = df_wh.groupby('title').agg({'Qty':'sum', 'Value':'sum'}).reset_index()
     wh_sum['unit_cost'] = wh_sum['Value'] / wh_sum['Qty'].replace(0, 1)
     
-    # Merge mappings
+    # Mapping Logic
     sales_mapped = pd.merge(df_sales, df_map, left_on='item_name', right_on='zoho_name', how='left')
     dio_data = pd.merge(sales_mapped, wh_sum[['title', 'unit_cost']], left_on='inventory_title', right_on='title', how='left')
     
+    # Ensure COGS uses the joined unit cost safely
     dio_data['unit_cost'] = dio_data['unit_cost'].fillna(0)
     total_cogs = (dio_data['quantity_sold'] * dio_data['unit_cost']).sum()
     avg_dio = (wh_sum['Value'].sum() / (total_cogs + 1)) * days_in_period
@@ -87,17 +88,15 @@ if all([f_inv, f_bill, f_sales, f_wh]):
         cust_bal = df_inv.groupby('customer_name')['bcy_balance'].sum().reset_index().sort_values('bcy_balance', ascending=False).head(10)
         st.plotly_chart(px.bar(cust_bal, x='customer_name', y='bcy_balance', title="Top 10 AR Balances"), use_container_width=True)
 
-    # --- TAB 2: INVENTORY AGEING ---
+    # --- TAB 2: INVENTORY AGEING (FIXED KeyError Logic) ---
     with tab_ageing:
         st.header("⏳ Inventory Health & Ageing")
-        item_stats = dio_data.groupby('inventory_title').agg({'quantity_sold':'sum', 'unit_cost':'first'}).reset_index()
-        item_stats = pd.merge(wh_sum, item_stats, left_on='title', right_on='inventory_title', how='left')
+        # Pre-calculate item turnover without messy multi-merges
+        item_sales_vol = dio_data.groupby('inventory_title')['quantity_sold'].sum().reset_index()
+        item_stats = pd.merge(wh_sum, item_sales_vol, left_on='title', right_on='inventory_title', how='left')
         
-        # Ensure unit_cost exists before calculation
-        if 'unit_cost_x' in item_stats.columns:
-            item_stats['unit_cost'] = item_stats['unit_cost_x']
-
-        item_stats['Item_DIO'] = (item_stats['Value'] / ((item_stats['quantity_sold'].fillna(0) * item_stats['unit_cost'].fillna(0)) + 1)) * days_in_period
+        # Calculate Individual Item DIO
+        item_stats['Item_DIO'] = (item_stats['Value'] / ((item_stats['quantity_sold'].fillna(0) * item_stats['unit_cost']) + 1)) * days_in_period
         
         def bucket_age(d):
             if d <= 30: return "0-30 Days (Fast)"
@@ -112,7 +111,7 @@ if all([f_inv, f_bill, f_sales, f_wh]):
         st.plotly_chart(fig_age, use_container_width=True)
         st.dataframe(item_stats[['title', 'Qty', 'Value', 'Item_DIO', 'Ageing Bucket']].sort_values('Value', ascending=False), use_container_width=True)
 
-    # --- TAB 3: MAPPINGS (WITH BULK TOOL) ---
+    # --- TAB 3: MAPPINGS (WITH BULK SUGGESTIONS) ---
     with tab_map:
         st.header("🔧 Mapping Management")
         
@@ -120,11 +119,12 @@ if all([f_inv, f_bill, f_sales, f_wh]):
         
         if unmapped:
             st.subheader("⚡ Bulk Suggestion Tool")
-            st.info(f"Found {len(unmapped)} unmapped Zoho items. I can suggest matches based on name similarity.")
+            st.info(f"Found {len(unmapped)} unmapped Zoho items.")
             
             suggestions = []
+            wh_titles = wh_sum['title'].tolist()
             for item in unmapped:
-                match = get_close_matches(item, wh_sum['title'].tolist(), n=1, cutoff=0.1)
+                match = get_close_matches(item, wh_titles, n=1, cutoff=0.1)
                 suggestions.append({"Zoho Name": item, "Suggested Warehouse SKU": match[0] if match else "No Match Found"})
             
             suggest_df = pd.DataFrame(suggestions)
@@ -134,22 +134,13 @@ if all([f_inv, f_bill, f_sales, f_wh]):
                 with conn.session as s:
                     for _, row in suggest_df.iterrows():
                         if row['Suggested Warehouse SKU'] != "No Match Found":
-                            s.execute(text("INSERT INTO item_mappings VALUES (:z, :i) ON CONFLICT (zoho_name) DO UPDATE SET inventory_title = EXCLUDED.inventory_title"), 
+                            s.execute(text("INSERT INTO item_mappings (zoho_name, inventory_title) VALUES (:z, :i) ON CONFLICT (zoho_name) DO UPDATE SET inventory_title = EXCLUDED.inventory_title"), 
                                       {"z": row['Zoho Name'], "i": row['Suggested Warehouse SKU']})
                     s.commit()
                 st.rerun()
 
-            st.divider()
-            st.subheader("Manual Mapping")
-            item_to_map = st.selectbox("Manually Select Zoho Item:", unmapped)
-            warehouse_match = st.selectbox("Link to Warehouse SKU:", sorted(wh_sum['title'].unique()))
-            if st.button("Save Manual Mapping"):
-                with conn.session as s:
-                    s.execute(text("INSERT INTO item_mappings VALUES (:z, :i) ON CONFLICT (zoho_name) DO UPDATE SET inventory_title = EXCLUDED.inventory_title"), {"z":item_to_map, "i":warehouse_match})
-                    s.commit()
-                st.rerun()
-        
-        st.subheader("Current Mappings")
+        st.divider()
+        st.subheader("Existing Mappings")
         st.dataframe(df_map, use_container_width=True)
 
 else:
