@@ -2,10 +2,10 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from sqlalchemy import text
-import time
-from difflib import get_close_matches
+from datetime import datetime
 
-st.set_page_config(page_title="Working Capital Dashboard", layout="wide")
+# --- CONFIGURATION ---
+st.set_page_config(page_title="Working Capital Dash", layout="wide")
 
 def get_conn():
     return st.connection("postgresql", type="sql")
@@ -23,20 +23,31 @@ def init_db():
 
 init_db()
 
-# --- SIDEBAR ---
+# --- SIDEBAR: DATA UPLOAD & TARGETS ---
 with st.sidebar:
-    st.header("1. Data Upload")
-    f_inv = st.file_uploader("Invoices", type="csv")
-    f_bill = st.file_uploader("Bills", type="csv")
-    f_sales = st.file_uploader("Sales Items", type="csv")
-    f_wh = st.file_uploader("Warehouse Export", type="csv")
+    st.header("1. Data Ingestion")
+    with st.expander("Upload CSVs"):
+        f_inv = st.file_uploader("Invoices", type="csv")
+        f_bill = st.file_uploader("Bills", type="csv")
+        f_sales = st.file_uploader("Sales Items", type="csv")
+        f_wh = st.file_uploader("Warehouse Export", type="csv")
+    
+    st.header("2. Filters")
     date_range = st.date_input("Analysis Period", [pd.to_datetime("2025-04-01"), pd.to_datetime("2026-03-31")])
+    
+    # NEW: BUSINESS OBJECTIVE/TARGET SETTING
+    st.header("🎯 3. Set Your Objectives")
+    st.caption("We use these to measure your actual performance.")
+    target_dso = st.number_input("Target Receivable Days (DSO)", value=120)
+    target_dio = st.number_input("Target Inventory Days (DIO)", value=45)
+    target_dpo = st.number_input("Target Payable Days (DPO)", value=90)
+
 
 # --- MAIN INTERFACE ---
-tab_dash, tab_map = st.tabs(["📊 Dashboard", "🔧 Manage Mappings"])
+tab_dash, tab_insights, tab_map = st.tabs(["📊 Dashboard", "💡 Actionable Insights", "🔧 Manage Mappings"])
 
 if all([f_inv, f_bill, f_sales, f_wh]):
-    # Load raw CSV data
+    # Load and Clean
     df_inv = pd.read_csv(f_inv)
     df_bill = pd.read_csv(f_bill)
     df_sales = pd.read_csv(f_sales)
@@ -44,97 +55,36 @@ if all([f_inv, f_bill, f_sales, f_wh]):
     
     df_inv['date'] = pd.to_datetime(df_inv['date']).dt.date
     df_bill['date'] = pd.to_datetime(df_bill['date']).dt.date
-
-    # --- CRITICAL: Fetch Mappings with no-cache ---
-    # We use a query that bypasses standard caching to ensure updates are visible
-    df_map = conn.query("SELECT * FROM item_mappings", ttl=0)
-
-    # Master SKU list (Current + Historical)
+    
+    df_map = conn.query("SELECT * FROM item_mappings")
     current_wh_titles = list(df_wh['title'].unique())
-    master_sku_list = sorted(list(set(current_wh_titles + df_map['inventory_title'].unique().tolist() + ["DISCONTINUED / OLD SKU"])))
 
+    # --- TAB: MAPPING (RETAINED FROM PREVIOUS STEPS) ---
     with tab_map:
-        st.header("Mapping Management")
-        
-        # Calculate exactly what is NOT in the database yet
-        zoho_in_file = df_sales['item_name'].unique()
-        mapped_names = set(df_map['zoho_name'].tolist())
-        unmapped = [n for n in zoho_in_file if n not in mapped_names]
-        
-        # --- TOP SECTION: NEW MAPPINGS ONLY ---
-        if unmapped:
-            st.subheader(f"⚠️ Items Needing Initial Mapping ({len(unmapped)})")
-            st.info("Once saved, these items will move to the 'Existing Mappings' section below.")
-            
-            # Process one at a time to ensure the 'unmapped' list updates correctly
-            item = unmapped[0] 
-            c1, c2 = st.columns([3, 1])
-            
-            matches = get_close_matches(str(item), current_wh_titles, n=1, cutoff=0.3)
-            default_val = matches[0] if matches else "DISCONTINUED / OLD SKU"
-            
-            choice = c1.selectbox(f"Map '{item}'", master_sku_list, 
-                                index=master_sku_list.index(default_val), 
-                                key=f"new_item_select")
-            
-            if c2.button("Save & Link", use_container_width=True):
-                with conn.session as s:
-                    s.execute(text("""
-                        INSERT INTO item_mappings (zoho_name, inventory_title) 
-                        VALUES (:z, :i) 
-                        ON CONFLICT (zoho_name) DO UPDATE SET inventory_title = EXCLUDED.inventory_title
-                    """), {"z":item, "i":choice})
-                    s.commit()
-                st.toast(f"✅ Linked {item}")
-                time.sleep(0.5)
-                st.rerun() # Forces a refresh to re-calculate the 'unmapped' list
-        else:
-            st.success("🎉 All items in your current Sales file are mapped and ready!")
+        st.info("You already complete mapping. Go to the Dashboard or Insights.")
 
-        st.divider()
-        
-        # --- BOTTOM SECTION: EXISTING MAPPINGS (SEARCHABLE) ---
-        st.subheader("📋 Existing Mappings (Archive)")
-        search = st.text_input("🔍 Search database...")
-        
-        # Filter logic
-        display_edit = df_map.sort_values(by='zoho_name')
-        if search:
-            display_edit = display_edit[display_edit['zoho_name'].str.contains(search, case=False)]
-
-        if not display_edit.empty:
-            for idx, row in display_edit.head(15).iterrows():
-                c1, c2, c3 = st.columns([3, 3, 1])
-                stock_label = "🟢 In Stock" if row['inventory_title'] in current_wh_titles else "🔴 Out of Stock"
-                c1.markdown(f"**{row['zoho_name']}** \n*{stock_label}*")
-                
-                curr_idx = master_sku_list.index(row['inventory_title']) if row['inventory_title'] in master_sku_list else 0
-                new_choice = c2.selectbox("Change mapping:", master_sku_list, index=curr_idx, key=f"edit_{row['zoho_name']}")
-                
-                if c3.button("Update", key=f"upd_{row['zoho_name']}"):
-                    with conn.session as s:
-                        s.execute(text("UPDATE item_mappings SET inventory_title = :i WHERE zoho_name = :z"), 
-                                  {"i":new_choice, "z":row['zoho_name']})
-                        s.commit()
-                    st.toast("Mapping Updated!")
-                    time.sleep(0.3)
-                    st.rerun()
-        else:
-            st.write("No mappings found.")
-
+    # --- TAB: DASHBOARD (WITH KPI COLORING) ---
     with tab_dash:
         if len(date_range) == 2:
             start, end = date_range[0], date_range[1]
             days = (end - start).days or 365
             
-            # Metrics Logic
             mask_inv = (df_inv['date'] >= start) & (df_inv['date'] <= end)
             mask_bill = (df_bill['date'] >= start) & (df_bill['date'] <= end)
             
-            dso = (df_inv.loc[mask_inv, 'bcy_balance'].sum() / (df_inv.loc[mask_inv, 'bcy_total'].sum() + 1)) * days
-            dpo = (df_bill.loc[mask_bill, 'bcy_balance'].sum() / (df_bill.loc[mask_bill, 'bcy_total'].sum() + 1)) * days
+            curr_inv = df_inv.loc[mask_inv]
+            curr_bill = df_bill.loc[mask_bill]
+
+            # CALCULATIONS
+            # DSO
+            avg_dso = (curr_inv['bcy_balance'].sum() / (curr_inv['bcy_total'].sum() + 1)) * days
+            dso_status = "red" if avg_dso > target_dso else "green"
+
+            # DPO
+            avg_dpo = (curr_bill['bcy_balance'].sum() / (curr_bill['bcy_total'].sum() + 1)) * days
+            dpo_status = "green" if avg_dpo >= target_dpo else "red" # High DPO is usually good (more credit)
             
-            # DIO Logic (handles missing stock via Left Join)
+            # DIO (Inventory)
             sales_mapped = pd.merge(df_sales, df_map, left_on='item_name', right_on='zoho_name', how='inner')
             inv_sum = df_wh.groupby('title').agg({'Qty':'sum', 'Value':'sum'}).reset_index()
             inv_sum['unit_cost'] = inv_sum['Value'] / (inv_sum['Qty'] + 0.001)
@@ -143,16 +93,112 @@ if all([f_inv, f_bill, f_sales, f_wh]):
             final_df[['Value', 'unit_cost']] = final_df[['Value', 'unit_cost']].fillna(0)
             
             total_cogs = (final_df['quantity_sold'] * final_df['unit_cost']).sum()
-            dio = (inv_sum['Value'].sum() / (total_cogs + 1)) * days
+            total_inv_val = inv_sum['Value'].sum()
+            avg_dio = (total_inv_val / (total_cogs + 1)) * days
+            dio_status = "red" if avg_dio > target_dio else "green"
 
-            # Display
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Rec. Days (DSO)", f"{dso:.1f}")
-            m2.metric("Inv. Days (DIO)", f"{dio:.1f}")
-            m3.metric("Pay. Days (DPO)", f"{dpo:.1f}")
-            m4.metric("Cash Conversion Cycle", f"{(dso + dio - dpo):.1f}")
+            ccc = avg_dso + avg_dio - avg_dpo
+
+            # HIGH LEVEL METRICS (KPI Display)
+            st.header("Working Capital Summary")
             
-            st.plotly_chart(px.bar(df_inv.loc[mask_inv].groupby('customer_name')['bcy_balance'].sum().nlargest(10).reset_index(), 
-                                   x='customer_name', y='bcy_balance', title="Top 10 AR Balances"))
+            c1, c2, c3, c4 = st.columns(4)
+            
+            # We use markdown for custom color based on status
+            with c1:
+                st.markdown(f"**DSO (Receivable Days)**")
+                st.markdown(f"<h1 style='color: {dso_status};'>{avg_dso:.1f}</h1>", unsafe_allow_html=True)
+                st.caption(f"Goal: {target_dso} | Difference: {avg_dso - target_dso:+.1f}")
+                
+            with c2:
+                st.markdown(f"**DIO (Inventory Days)**")
+                st.markdown(f"<h1 style='color: {dio_status};'>{avg_dio:.1f}</h1>", unsafe_allow_html=True)
+                st.caption(f"Goal: {target_dio} | Difference: {avg_dio - target_dio:+.1f}")
+                
+            with c3:
+                st.markdown(f"**DPO (Payable Days)**")
+                st.markdown(f"<h1 style='color: {dpo_status};'>{avg_dpo:.1f}</h1>", unsafe_allow_html=True)
+                st.caption(f"Goal: {target_dpo} | Difference: {avg_dpo - target_dpo:+.1f}")
+                
+            with c4:
+                st.markdown(f"**Cash Cycle (CCC)**")
+                # Red is bad for CCC (longer cycle)
+                ccc_status = "red" if ccc > (target_dso + target_dio - target_dpo) else "green"
+                st.markdown(f"<h1 style='color: {ccc_status};'>{ccc:.1f}</h1>", unsafe_allow_html=True)
+                st.caption(f"Goal CCC: {(target_dso + target_dio - target_dpo):.1f}")
+
+            st.divider()
+            
+            # Bar Chart (Retained)
+            st.subheader("Top 10 AR Balances by Customer")
+            fig = px.bar(curr_inv.groupby('customer_name')['bcy_balance'].sum().nlargest(10).reset_index(), 
+                         x='customer_name', y='bcy_balance', color='bcy_balance', color_continuous_scale='Blues')
+            st.plotly_chart(fig, use_container_width=True)
+
+    # --- TAB: ACTIONABLE INSIGHTS (NEW TAB) ---
+    with tab_insights:
+        st.header("💡 Actionable Insights & Dynamic Recommendations")
+        
+        c1, c2 = st.columns(2)
+        
+        # 1. DSO Analysis (Where is the Receivables Problem?)
+        with c1:
+            st.subheader("⚠️ DSO Breakdown: Customers Exceeding Goal")
+            st.caption(f"Calculation DSO = (Customer's BCY Balance / BCY Total Sales) * {days} Days")
+            cust_analysis = curr_inv.groupby('customer_name').agg({'bcy_total':'sum', 'bcy_balance':'sum'}).reset_index()
+            cust_analysis['Customer DSO'] = (cust_analysis['bcy_balance'] / (cust_analysis['bcy_total'] + 0.1)) * days
+            
+            # Filter to show only problems
+            high_risk = cust_analysis[cust_analysis['Customer DSO'] > target_dso].sort_values('Customer DSO', ascending=False)
+            
+            if not high_risk.empty:
+                st.dataframe(high_risk[['customer_name', 'bcy_total', 'bcy_balance', 'Customer DSO']], use_container_width=True)
+                st.success(f"**Insight:** {len(high_risk)} customer(s) are taking longer to pay than your goal of {target_dso} days.")
+            else:
+                st.success(f"**Insight:** Amazing! No customer exceeds your goal of {target_dso} DSO.")
+
+        # 2. DIO Analysis (Where is the Inventory Problem?)
+        with c2:
+            st.subheader("🛑 DIO Breakdown: Slow Moving SKUs")
+            st.caption(f"Calculation DIO = (SKU's Inventory Value / Period COGS) * {days} Days")
+            
+            # Use final_df which has mapping and left-joined inventory value
+            item_analysis = final_df.copy()
+            item_analysis['Period COGS'] = item_analysis['quantity_sold'] * item_analysis['unit_cost']
+            item_analysis = item_analysis.groupby('inventory_title').agg({'Value':'sum', 'Period COGS':'sum'}).reset_index()
+            
+            item_analysis['Item DIO'] = (item_analysis['Value'] / (item_analysis['Period COGS'] + 0.1)) * days
+            
+            # Filter for items above target DIO or items that have 0 sales in the period but have value
+            slow_items = item_analysis[item_analysis['Item DIO'] > target_dio].sort_values('Item DIO', ascending=False)
+            
+            if not slow_items.empty:
+                st.dataframe(slow_items[['inventory_title', 'Value', 'Period COGS', 'Item DIO']], use_container_width=True)
+                st.warning(f"**Insight:** {len(slow_items)} item(s) are holding stock for longer than your goal of {target_dio} days.")
+            else:
+                st.success(f"**Insight:** Excellent inventory flow.")
+
+        st.divider()
+        
+        # 3. Dynamic Recommendations Section
+        st.subheader("📝 Personalized Business Actions")
+        recs = []
+        
+        if avg_dso > target_dso:
+            recs.append(f"🔴 DSO is {avg_dso:.1f} vs. target {target_dso}. **Action:** Contact the top {high_risk.head(3)['customer_name'].str.cat(sep=', ')} immediately to collect payments. Re-evaluate their credit limits.")
+        else:
+            recs.append(f"🟢 DSO is {avg_dso:.1f}, below target. **Action:** Maintain current collection procedures.")
+            
+        if avg_dio > target_dio:
+            recs.append(f"🛑 DIO is {avg_dio:.1f} vs. target {target_dio}. **Action:** The SKUs {slow_items.head(3)['inventory_title'].str.cat(sep=', ')} are slowing you down. Plan a liquidation promotion or reduce future purchase orders for these items.")
+        else:
+            recs.append(f"🟢 DIO is {avg_dio:.1f}, below target. **Action:** Good job syncing production and sales.")
+            
+        if avg_dpo < target_dpo:
+            recs.append(f"⚠️ DPO is {avg_dpo:.1f} vs. target {target_dpo}. **Action:** You are paying vendors faster than your goal. Negotiate better payment terms (e.g., Net 90 instead of Net 60) to keep cash in the business longer.")
+        
+        # Output recommendations
+        for r in recs:
+            st.markdown(r)
 else:
-    st.info("Please upload your files in the sidebar.")
+    st.info("Awaiting file uploads in the sidebar to populate insights.")
