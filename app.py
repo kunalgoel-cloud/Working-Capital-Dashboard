@@ -47,22 +47,27 @@ if all([f_inv, f_bill, f_sales, f_wh]):
     # 2. CORE CALCULATIONS
     days_in_period = (date_range[1] - date_range[0]).days or 365
     
-    # Receivables (DSO) & Payables (DPO)
+    # Receivables & Payables
     avg_dso = (df_inv['bcy_balance'].sum() / (df_inv['bcy_total'].sum() + 1)) * days_in_period
     avg_dpo = (df_bill['bcy_balance'].sum() / (df_bill['bcy_total'].sum() + 1)) * days_in_period
 
-    # Inventory Logic (DIO)
+    # 3. STABILIZED DIO LOGIC
+    # Get total value and Qty from warehouse
     wh_sum = df_wh.groupby('title').agg({'Qty':'sum', 'Value':'sum'}).reset_index()
     wh_sum['unit_cost'] = wh_sum['Value'] / wh_sum['Qty'].replace(0, 1)
     
-    sales_mapped = pd.merge(df_sales, df_map, left_on='item_name', right_on='zoho_name', how='left')
+    # Map sales items to warehouse titles
+    sales_mapped = pd.merge(df_sales, df_map, left_on='item_name', right_on='zoho_name', how='inner')
+    
+    # Join unit cost from warehouse sum
     dio_data = pd.merge(sales_mapped, wh_sum[['title', 'unit_cost']], left_on='inventory_title', right_on='title', how='left')
     
-    dio_data['unit_cost'] = dio_data['unit_cost'].fillna(0)
-    total_cogs = (dio_data['quantity_sold'] * dio_data['unit_cost']).sum()
-    avg_dio = (wh_sum['Value'].sum() / (total_cogs + 1)) * days_in_period
+    # COGS = Quantity Sold * Unit Cost
+    total_cogs = (dio_data['quantity_sold'] * dio_data['unit_cost'].fillna(0)).sum()
+    total_inv_val = wh_sum['Value'].sum()
     
-    # Cash Conversion Cycle
+    # Final DIO calculation
+    avg_dio = (total_inv_val / (total_cogs + 1)) * days_in_period
     ccc = avg_dso + avg_dio - avg_dpo
 
     # --- TAB 1: DASHBOARD ---
@@ -78,62 +83,20 @@ if all([f_inv, f_bill, f_sales, f_wh]):
         c1, c2 = st.columns(2)
         with c1:
             top_debtor = df_inv.groupby('customer_name')['bcy_balance'].sum().idxmax()
-            st.error(f"**Collections Priority:** Your DSO is {avg_dso:.1f}d. Focus on **{top_debtor}**.")
+            st.error(f"**Collections Priority:** Focus on **{top_debtor}** to reduce DSO.")
         with c2:
-            st.warning(f"**Inventory Priority:** Total stock value is **₹{wh_sum['Value'].sum():,.0f}**. Reducing DIO unlocks cash.")
+            st.warning(f"**Inventory Priority:** Total value **₹{total_inv_val:,.0f}**. COGS tracked: **₹{total_cogs:,.0f}**.")
 
         cust_bal = df_inv.groupby('customer_name')['bcy_balance'].sum().reset_index().sort_values('bcy_balance', ascending=False).head(10)
         st.plotly_chart(px.bar(cust_bal, x='customer_name', y='bcy_balance', title="Top 10 AR Balances"), use_container_width=True)
 
-    # --- TAB 2: INVENTORY AGEING ---
-    with tab_ageing:
-        st.header("⏳ Inventory Health & Ageing")
-        item_sales_vol = dio_data.groupby('inventory_title')['quantity_sold'].sum().reset_index()
-        item_stats = pd.merge(wh_sum, item_sales_vol, left_on='title', right_on='inventory_title', how='left')
-        
-        # Safe DIO Calculation
-        item_stats['Item_DIO'] = (item_stats['Value'] / ((item_stats['quantity_sold'].fillna(0) * item_stats['unit_cost']) + 1)) * days_in_period
-        
-        def get_bucket(d):
-            if d <= 30: return "0-30 Days (Fast)"
-            if d <= 90: return "31-90 Days (Healthy)"
-            return "90+ Days (High Risk)"
-        
-        item_stats['Ageing Bucket'] = item_stats['Item_DIO'].apply(get_bucket)
-        
-        st.plotly_chart(px.pie(item_stats, values='Value', names='Ageing Bucket', hole=0.4), use_container_width=True)
-        st.dataframe(item_stats[['title', 'Qty', 'Value', 'Item_DIO', 'Ageing Bucket']].sort_values('Value', ascending=False), use_container_width=True)
-
-    # --- TAB 3: MAPPINGS (RESTORED EDITOR) ---
+    # --- TAB 3: MAPPINGS (RESTORED MANUAL EDITOR) ---
     with tab_map:
         st.header("🔧 Mapping Management")
         
-        unmapped = [n for n in df_sales['item_name'].unique() if n not in df_map['zoho_name'].tolist()]
-        
-        # 1. Bulk Suggestion Tool
-        if unmapped:
-            st.subheader("⚡ Bulk Suggestion Tool")
-            suggestions = []
-            for item in unmapped:
-                match = get_close_matches(item, wh_sum['title'].tolist(), n=1, cutoff=0.1)
-                suggestions.append({"Zoho Name": item, "Suggested Warehouse SKU": match[0] if match else "No Match Found"})
-            
-            suggest_df = pd.DataFrame(suggestions)
-            st.table(suggest_df)
-            
-            if st.button("Apply All Suggestions"):
-                with conn.session as s:
-                    for _, row in suggest_df.iterrows():
-                        if row['Suggested Warehouse SKU'] != "No Match Found":
-                            s.execute(text("INSERT INTO item_mappings (zoho_name, inventory_title) VALUES (:z, :i) ON CONFLICT (zoho_name) DO UPDATE SET inventory_title = EXCLUDED.inventory_title"), 
-                                      {"z": row['Zoho Name'], "i": row['Suggested Warehouse SKU']})
-                    s.commit()
-                st.rerun()
-
-        st.divider()
-        # 2. Manual Mapping Tool (RESTORED)
-        st.subheader("🖊️ Manual Mapping Editor")
-        with st.form("manual_map"):
+        # Manual Editor Form
+        with st.form("manual_map_form"):
+            st.subheader("🖊️ Manual Mapping Editor")
             col1, col2 = st.columns(2)
             z_item = col1.selectbox("Zoho Item Name", sorted(df_sales['item_name'].unique()))
             w_sku = col2.selectbox("Warehouse SKU", sorted(wh_sum['title'].unique()))
@@ -143,9 +106,10 @@ if all([f_inv, f_bill, f_sales, f_wh]):
                               {"z": z_item, "i": w_sku})
                     s.commit()
                 st.rerun()
-
-        st.subheader("Current Mappings")
+        
+        st.divider()
+        st.subheader("Current Mapping Table")
         st.dataframe(df_map, use_container_width=True)
 
 else:
-    st.info("👋 Welcome! Please upload your 4 CSV files in the sidebar to populate the dashboard.")
+    st.info("👋 Please upload your 4 CSV files to activate the dashboard.")
